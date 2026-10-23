@@ -41,6 +41,10 @@ set_error_handler(static function (int $severity, string $message, string $file,
 
 function notifyTestConnect(string $filename): Typecho_Db
 {
+    if ($filename === ':memory:') {
+        // Typecho has separate read/write connections; share a unique in-memory database.
+        $filename = 'file:comment-notify-' . bin2hex(random_bytes(8)) . '?mode=memory&cache=shared';
+    }
     $db = new Typecho_Db('Pdo_SQLite', 'typecho_');
     $db->addServer(['file' => $filename], Typecho_Db::READ | Typecho_Db::WRITE);
     Typecho_Db::set($db);
@@ -112,19 +116,29 @@ function notifyTestSame($expected, $actual, string $message): void
     notifyTestAssert($expected === $actual, $message . ' | expected=' . var_export($expected, true) . ', actual=' . var_export($actual, true));
 }
 
-function notifyTestStartPhp(array $arguments, ?array $environment = null): array
+function notifyTestSnapshot(Typecho_Db $db): array
+{
+    return [
+        'options' => $db->fetchAll($db->select()->from('table.options')->order('name')),
+        'state' => $db->fetchAll($db->select()->from('table.comment_notify_state')->order('name')),
+    ];
+}
+
+function notifyTestStartPhp(array $arguments, ?array $environment = null, ?string $stderrFile = null): array
 {
     $command = [PHP_BINARY];
     if (php_ini_loaded_file()) {
         array_push($command, '-c', php_ini_loaded_file());
     }
     array_push($command, '-d', 'display_errors=stderr');
+    array_push($command, '-d', 'disable_functions=curl_exec');
     $pipes = [];
+    $environment = $environment === null ? null : array_replace(getenv(), $environment);
     $process = proc_open(array_merge($command, $arguments),
-        [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, __DIR__, $environment);
+        [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => $stderrFile === null ? ['pipe', 'w'] : ['file', $stderrFile, 'a']], $pipes, __DIR__, $environment);
     notifyTestAssert(is_resource($process), 'Launch isolated PHP process');
     fclose($pipes[0]);
-    return ['process' => $process, 'stdout' => $pipes[1], 'stderr' => $pipes[2]];
+    return ['process' => $process, 'stdout' => $pipes[1], 'stderr' => $pipes[2] ?? fopen($stderrFile, 'r')];
 }
 
 function notifyTestFinishPhp(array $worker): array
@@ -134,42 +148,4 @@ function notifyTestFinishPhp(array $worker): array
     fclose($worker['stdout']);
     fclose($worker['stderr']);
     return ['code' => proc_close($worker['process']), 'stdout' => $stdout, 'stderr' => $stderr];
-}
-
-function notifyTestStartGateway(string $directory): array
-{
-    $socket = stream_socket_server('tcp://127.0.0.1:0', $errno, $message);
-    notifyTestAssert(is_resource($socket), 'Allocate a random loopback mock port');
-    $address = stream_socket_get_name($socket, false);
-    fclose($socket);
-    $port = (int) substr(strrchr($address, ':'), 1);
-    $worker = notifyTestStartPhp(['-S', '127.0.0.1:' . $port, __DIR__ . '/gateway.php'], [
-        'NOTIFY_TEST_DIRECTORY' => $directory,
-    ]);
-    $deadline = microtime(true) + 5;
-    do {
-        $probe = @stream_socket_client('tcp://127.0.0.1:' . $port, $errno, $message, 0.05);
-        if (is_resource($probe)) {
-            fclose($probe);
-            return $worker + ['url' => 'http://127.0.0.1:' . $port];
-        }
-        usleep(10000);
-    } while (microtime(true) < $deadline);
-    proc_terminate($worker['process']);
-    throw new RuntimeException('The local HTTP mock did not start.');
-}
-
-function notifyTestRequests(string $directory): array
-{
-    $filename = $directory . '/requests.jsonl';
-    if (!is_file($filename)) {
-        return [];
-    }
-    return array_map(static fn (string $line): array => json_decode($line, true, 512, JSON_THROW_ON_ERROR),
-        file($filename, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES));
-}
-
-function notifyTestScenario(string $directory, string $scenario): void
-{
-    file_put_contents($directory . '/scenario', $scenario, LOCK_EX);
 }

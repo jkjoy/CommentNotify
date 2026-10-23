@@ -3,251 +3,163 @@ if (!defined('__TYPECHO_ROOT_DIR__')) {
     exit;
 }
 
-require_once __DIR__ . '/Transport.php';
 require_once __DIR__ . '/Service.php';
 
 /**
- * 评论通知：独立 QQ / 微信通知，支持复用 OpenClaw 机器人。
+ * 新评论通过官方 QQ 机器人和微信 iLink 通知站长。
  *
  * @package CommentNotify
  * @author jkjoy
- * @version 1.0.0
+ * @version 2.0.0
  * @since 1.2.0
  */
 class CommentNotify_Plugin implements Typecho_Plugin_Interface
 {
-    private static $comments = array();
-    private static $registered = false;
-
     public static function activate()
     {
-        if (!extension_loaded('curl')) {
-            throw new Typecho_Plugin_Exception('评论通知需要 PHP cURL 扩展。');
+        if (PHP_VERSION_ID < 80000 || !extension_loaded('curl')) {
+            throw new Typecho_Plugin_Exception('评论通知需要 PHP 8.0 或更高版本，并启用 cURL 扩展。');
         }
-        try {
-            CommentNotify_Service::install();
-        } catch (Throwable $e) {
-            throw new Typecho_Plugin_Exception('无法创建评论通知队列，请检查数据库权限与数据库类型。');
-        }
-        Typecho_Plugin::factory('Widget_Feedback')->finishComment = array(__CLASS__, 'finishComment');
-        Typecho_Plugin::factory('Widget_Comments_Edit')->finishComment = array(__CLASS__, 'finishComment');
-        Typecho_Plugin::factory('Widget_Comments_Edit')->mark = array(__CLASS__, 'mark');
-        Typecho_Plugin::factory('index.php')->begin = array(__CLASS__, 'registerFlush');
-        Typecho_Plugin::factory('admin/common.php')->begin = array(__CLASS__, 'registerFlush');
+        comment_notify_storage_ensure();
+        Typecho_Plugin::factory('Widget_Feedback')->finishComment = [__CLASS__, 'finishComment'];
+        Typecho_Plugin::factory('Widget_Comments_Edit')->finishComment = [__CLASS__, 'finishComment'];
         Helper::addAction('comment-notify', 'CommentNotify_Action');
-        Helper::addPanel(3, 'CommentNotify/manage.php', '评论通知', '评论通知记录', 'administrator');
-        return '评论通知已启用。请先配置 QQ / 微信并测试，再开启对应通知。';
+        Helper::removePanel(3, 'CommentNotify/manage.php');
+        return '评论通知已启用，请在设置中配置 QQ 机器人或扫码连接微信。';
     }
 
     public static function deactivate()
     {
         Helper::removeAction('comment-notify');
         Helper::removePanel(3, 'CommentNotify/manage.php');
-        return '评论通知已停用，通知记录保留。';
+        return '评论通知已停用。';
     }
 
     public static function config(Typecho_Widget_Helper_Form $form)
     {
-        $intro = new Typecho_Widget_Helper_Layout('p');
-        $intro->html('复用已经登录的 OpenClaw QQ / 微信通道，发送已审核评论。微信目前支持私聊，需先向机器人发过消息。'
-            . ' <a href="' . self::e(Helper::url('CommentNotify/manage.php')) . '">查看通知记录</a>。'
-            . ' 从 Enhancement 迁移时，请关闭原插件的 QQ 评论通知，避免重复提醒。');
-        $form->addItem($intro);
-        self::heading($form, 'OpenClaw 网关');
-        self::text($form, 'gateway_url', '网关地址', '例如 http://openclaw:18789，仅填写根地址；PHP 服务需要能访问该地址。');
-        self::secret($form, 'gateway_token', '网关访问令牌', '填写 OpenClaw Gateway Token。留空保留已保存的令牌；更换地址时请重新填写。');
+        $config = comment_notify_config();
+        $status = comment_notify_status();
+        $form->addInput(new Typecho_Widget_Helper_Form_Element_Hidden('protocol_version', null, '2'));
+        self::html($form, '<p>新评论提交后，直接通过 QQ 官方机器人或微信通知站长。配置后请先保存，再进行绑定或测试。'
+            . '如果 Enhancement 已开启 QQ 评论通知，请关闭其中的同类通知，避免重复提醒。</p>');
 
-        self::heading($form, 'QQ 通知');
-        $form->addInput(new Typecho_Widget_Helper_Form_Element_Select('qq_enabled', array('0' => '关闭', '1' => '开启'), '0', 'QQ 评论通知'));
-        $form->addInput(new Typecho_Widget_Helper_Form_Element_Select('qq_provider', array('openclaw' => 'OpenClaw QQ 机器人', 'service' => '独立 QQ 通道 / 官方 QQ Bot 服务'), 'openclaw', 'QQ 通知方式'));
-        self::text($form, 'qq_channel', 'QQ 通道名称', '通常为 qqbot；按 OpenClaw 实际安装的通道填写。', 'qqbot');
-        self::text($form, 'qq_account', 'QQ 账号 ID', '单账号可留空；多账号填写 OpenClaw 中的 accountId。');
-        self::text($form, 'qq_service_url', 'QQ 服务地址', '仅独立 QQ 通道使用，与 Enhancement 的 QQ 服务根地址相同。');
-        self::secret($form, 'qq_service_token', 'QQ 服务令牌', '仅独立 QQ 通道使用。留空保留已保存的令牌；更换地址时请重新填写。');
-        $form->addInput(new Typecho_Widget_Helper_Form_Element_Textarea('qq_targets', null, '', 'QQ 接收目标', '每行一个，最多 20 个。OpenClaw 使用 qqbot:c2c:用户OpenID、qqbot:group:群OpenID 或 qqbot:channel:频道ID；独立 QQ 服务填写已绑定别名，例如 owner。'));
+        self::heading($form, '官方 QQ 机器人');
+        self::toggle($form, 'qq_enabled', 'QQ 评论通知', $config['qq_enabled']);
+        self::text($form, 'qq_app_id', 'QQ AppID', '在 <a href="https://q.qq.com/" target="_blank" rel="noopener noreferrer">QQ 开放平台</a>创建机器人，填写正式环境 AppID。', $config['qq_app_id']);
+        $secret = new CommentNotify_Secret('qq_app_secret', null, '', 'QQ AppSecret', '留空保留已保存的密钥；更换 AppID 时必须重新填写 AppSecret。');
+        $secret->input->setAttribute('autocomplete', 'new-password')->setAttribute('maxlength', '256');
+        $secret->input->setAttribute('placeholder', $config['qq_app_secret'] !== '' ? '已保存，留空保留' : '填写机器人 AppSecret');
+        $form->addInput($secret);
+        $form->addInput(new Typecho_Widget_Helper_Form_Element_Select('qq_target_type', [
+            'c2c' => 'QQ 私聊（用户 OpenID）', 'group' => 'QQ 群（群 OpenID）', 'channel' => 'QQ 频道（子频道 ID）',
+        ], $config['qq_target_type'], 'QQ 接收类型'));
+        self::text($form, 'qq_target_id', 'QQ 接收 ID', '私聊和群聊可用下方绑定码自动获取 OpenID，不能填写 QQ 号或群号；频道请填写子频道 ID。接收人须先添加机器人或将机器人加入目标群，并具备主动消息权限。', $config['qq_target_id']);
 
         self::heading($form, '微信通知');
-        $form->addInput(new Typecho_Widget_Helper_Form_Element_Select('wechat_enabled', array('0' => '关闭', '1' => '开启'), '0', '微信评论通知'));
-        self::text($form, 'wechat_channel', '微信通道名称', '腾讯微信插件通常为 openclaw-weixin；使用其他通道插件时按实际名称填写。', 'openclaw-weixin');
-        self::text($form, 'wechat_account', '微信账号 ID', '多微信账号建议明确填写 OpenClaw 的 accountId。');
-        $form->addInput(new Typecho_Widget_Helper_Form_Element_Textarea('wechat_targets', null, '', '微信接收目标', '每行一个，最多 20 个。腾讯微信插件使用 xxx@im.wechat 形式的用户 ID，不能填微信号或昵称。需先私聊机器人建立会话，主动发送受微信平台会话有效期限制。'));
+        self::toggle($form, 'weixin_enabled', '微信评论通知', $config['weixin_enabled'], '先在下方扫码登录、同步并绑定接收人，再开启通知。');
+        $recipient = new Typecho_Widget_Helper_Form_Element_Text('weixin_user_id', null, $config['weixin_user_id'], '微信接收人', '从微信机器人实际收到的消息中绑定；会话过期后，请给机器人发消息并重新同步。');
+        $recipient->input->setAttribute('readonly', 'readonly')->setAttribute('placeholder', '尚未绑定');
+        $form->addInput($recipient);
 
         self::heading($form, '通知规则');
-        $form->addInput(new Typecho_Widget_Helper_Form_Element_Select('include_links', array('1' => '包含链接', '0' => '省略链接'), '1', '通知中的链接', 'QQ 未报备消息域名时可选择省略链接；评论内容里的链接也会省略。'));
-        $form->addInput(new Typecho_Widget_Helper_Form_Element_Select('notify_owner', array('0' => '跳过作者自己的评论', '1' => '同时通知作者自己的评论'), '0', '作者回复'));
+        self::toggle($form, 'notify_pending', '通知待审核的新评论', $config['notify_pending']);
+        self::toggle($form, 'notify_approved', '通知直接通过审核的新评论', $config['notify_approved'], '仅在新评论提交时通知，之后审核通过不会再次发送。');
+        self::toggle($form, 'notify_admin', '通知登录用户自己发表的评论', $config['notify_admin']);
+        self::toggle($form, 'include_link', '附上文章链接', $config['include_link'], 'QQ 可能要求配置消息域名白名单；平台拒绝链接时可关闭此项。');
 
-        $test = new Typecho_Widget_Helper_Layout('div', array('id' => 'comment-notify-test', 'data-url' => self::e(Typecho_Widget::widget('Widget_Security')->getIndex('action/comment-notify?do=test'))));
-        $test->html('<h3>测试通知</h3><p>使用当前填写的配置测试所选通道，可在开启通知前验证。测试不会保存设置。</p>'
-            . '<p><button type="button" class="btn" data-kind="qq">测试 QQ 通知</button> '
-            . '<button type="button" class="btn" data-kind="wechat">测试微信通知</button></p>'
-            . '<p id="comment-notify-result" role="status" aria-live="polite" hidden></p>');
-        $form->addItem($test);
-        $script = new Typecho_Widget_Helper_Layout('script', array('defer' => 'defer', 'src' => self::e(Typecho_Common::url('CommentNotify/assets/settings.js?v=1.0.0', Typecho_Widget::widget('Widget_Options')->pluginUrl))));
-        $script->setClose(false);
-        $form->addItem($script);
-    }
-
-    private static function heading($form, $title)
-    {
-        $heading = new Typecho_Widget_Helper_Layout('h3');
-        $heading->html(self::e($title));
-        $form->addItem($heading);
-    }
-
-    private static function text($form, $key, $label, $description, $default = '')
-    {
-        $form->addInput(new Typecho_Widget_Helper_Form_Element_Text($key, null, $default, $label, $description));
-    }
-
-    private static function secret($form, $key, $label, $description)
-    {
-        $field = new CommentNotify_Secret($key, null, '', $label, $description);
-        $field->input->setAttribute('autocomplete', 'new-password');
-        $form->addInput($field);
-    }
-
-    public static function personalConfig(Typecho_Widget_Helper_Form $form) {}
-
-    /** Never reuse a saved credential for a newly entered destination. */
-    public static function mergeSecrets(array $input): array
-    {
-        $settings = CommentNotify_Transport::normalize($input);
-        $saved = CommentNotify_Service::settings();
-        foreach (array('gateway' => 'gateway_url', 'qq_service' => 'qq_service_url') as $prefix => $urlKey) {
-            $key = $prefix . '_token';
-            if ($settings[$key] === '') {
-                if ($settings[$urlKey] === $saved[$urlKey]) {
-                    $settings[$key] = $saved[$key];
-                } elseif ($settings[$urlKey] !== '' && $saved[$key] !== '') {
-                    throw new InvalidArgumentException('更换机器人地址时，请重新填写该服务的访问令牌。');
-                }
-            }
+        $controls = new Typecho_Widget_Helper_Layout('div', [
+            'id' => 'comment-notify-settings',
+            'data-url' => self::e(Typecho_Widget::widget('Widget_Security')->getIndex('action/comment-notify')),
+            'data-status' => self::e(json_encode($status, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE)),
+        ]);
+        $controls->html('<h3>QQ Webhook 与接收人绑定</h3>'
+            . '<p><label for="comment-notify-webhook">官方事件回调地址</label><br><input type="text" id="comment-notify-webhook" readonly autocomplete="off" spellcheck="false" style="width:100%"></p>'
+            . '<ol><li>填写 AppID、AppSecret 和接收类型并保存；尚无接收 ID 时先保持 QQ 通知关闭。</li>'
+            . '<li>在 QQ 开放平台的事件订阅中配置回调地址，地址须为公网可访问的 HTTPS。私聊订阅 <code>C2C_MESSAGE_CREATE</code>，群聊订阅 <code>GROUP_AT_MESSAGE_CREATE</code>。</li>'
+            . '<li>生成绑定码，在目标私聊中发送绑定命令；群聊须 @机器人发送命令。</li>'
+            . '<li>发送后刷新绑定状态，确认接收 ID，再开启 QQ 通知、保存并测试。</li></ol>'
+            . '<p id="comment-notify-qq-status"></p>'
+            . '<div id="comment-notify-binding" hidden><p><label for="comment-notify-command">一次性绑定命令</label><br><input type="text" id="comment-notify-command" readonly autocomplete="off" spellcheck="false"></p><p id="comment-notify-binding-hint"></p></div>'
+            . '<p><button type="button" class="btn" data-action="qq_binding_start">生成绑定码</button> '
+            . '<button type="button" class="btn" data-action="qq_binding_cancel" hidden>取消本次绑定</button> '
+            . '<button type="button" class="btn" data-action="status">刷新绑定状态</button></p>'
+            . '<p id="comment-notify-qq-events" class="description"></p>'
+            . '<h3>微信连接</h3><p id="comment-notify-weixin-status"></p>'
+            . '<p>获取二维码 → 微信扫码并确认 → 检查登录状态 → 给机器人发送“绑定通知” → 同步接收人 → 开启微信通知并保存。</p>'
+            . '<div id="comment-notify-qr-section" hidden><div id="comment-notify-qr" aria-live="polite"></div><p>二维码在浏览器本地生成，使用微信扫码后在手机上确认。</p><p><a id="comment-notify-qr-link" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">打开微信官方登录链接</a></p></div>'
+            . '<p id="comment-notify-verify" hidden><label for="comment-notify-verify-code">手机微信显示的数字验证码</label><br><input type="text" id="comment-notify-verify-code" inputmode="numeric" autocomplete="one-time-code" maxlength="12" pattern="[0-9]{1,12}"></p>'
+            . '<p><button type="button" class="btn" data-action="weixin_start">获取登录二维码</button> '
+            . '<button type="button" class="btn" data-action="weixin_check" hidden>检查登录状态</button> '
+            . '<button type="button" class="btn" data-action="weixin_sync" hidden>同步微信接收人</button> '
+            . '<button type="button" class="btn" data-action="weixin_disconnect" hidden>退出微信登录</button></p>'
+            . '<div id="comment-notify-candidates" hidden><p><label for="comment-notify-candidate">选择刚刚发送消息的接收人</label><br><select id="comment-notify-candidate"><option value="">请选择接收人</option></select> '
+            . '<button type="button" class="btn" data-action="weixin_bind">绑定选中的接收人</button></p></div>'
+            . '<p class="description">退出登录会清除微信凭证、接收人并关闭微信通知。微信会限制主动消息与会话有效期。</p>'
+            . '<h3>测试与最近结果</h3><p>测试使用已保存的设置，立即发送一条消息。修改设置后请先点击页面底部的“保存设置”。</p>'
+            . '<p><button type="button" class="btn" data-action="test_qq">发送 QQ 测试通知</button> '
+            . '<button type="button" class="btn" data-action="test_weixin">发送微信测试通知</button></p>'
+            . '<p id="comment-notify-result-qq"></p><p id="comment-notify-result-weixin"></p>'
+            . '<p id="comment-notify-message" role="status" aria-live="polite" hidden></p>'
+            . '<noscript><p>绑定和测试需要启用 JavaScript；填写设置后仍可使用下方按钮保存。</p></noscript>');
+        $form->addItem($controls);
+        $base = Typecho_Common::url('CommentNotify/assets/', Typecho_Widget::widget('Widget_Options')->pluginUrl);
+        foreach (['vendor/qrcode.js', 'vendor/qrcode_UTF8.js', 'settings.js'] as $file) {
+            $script = new Typecho_Widget_Helper_Layout('script', ['defer' => 'defer', 'src' => self::e($base . $file . '?v=2.0.0')]);
+            $script->setClose(false);
+            $form->addItem($script);
         }
-        return $settings;
     }
 
     public static function configHandle($settings, $isInit)
     {
-        try {
-            $settings = CommentNotify_Transport::validate(self::mergeSecrets($settings));
-        } catch (InvalidArgumentException $e) {
-            throw new Typecho_Widget_Exception($e->getMessage(), 400);
+        $validated = comment_notify_validate($settings, comment_notify_config());
+        if ($validated['errors']) {
+            throw new Typecho_Widget_Exception(implode(' ', $validated['errors']), 400);
         }
-        Typecho_Widget::widget('Widget_Plugins_Edit')->configPlugin('CommentNotify', $settings);
-        try {
-            // Typecho does not invalidate this widget cache after configPlugin().
-            // Shutdown processing in the same request must see the saved switches.
-            Typecho_Widget::widget('Widget_Options')->plugin('CommentNotify')->setDefault($settings, true);
-        } catch (Typecho_Plugin_Exception $e) {
-            // On first activation there was no option in the already-loaded widget;
-            // all channels are disabled in the initial defaults.
-        }
+        comment_notify_save_config($validated['config']);
     }
+
+    public static function personalConfig(Typecho_Widget_Helper_Form $form) {}
 
     public static function finishComment($comment)
     {
         try {
-            // These two finish hooks run after INSERT. Persist before leaving the
-            // request; only moderation needs to wait for Typecho's later UPDATE.
-            self::queueComment((int) $comment->coid);
-            self::registerFlush();
+            comment_notify_comment_created((int)$comment->coid);
         } catch (Throwable $e) {
-            error_log('[CommentNotify] 无法登记新评论通知。');
+            error_log('[CommentNotify] 无法准备评论通知。');
         }
         return $comment;
     }
 
-    public static function mark($comment, $editor, $status)
+    private static function heading($form, string $title): void
     {
-        if ($status === 'approved') {
-            // Typecho calls mark BEFORE its UPDATE. Read the committed row at shutdown.
-            try {
-                self::remember((int) (is_array($comment) ? $comment['coid'] : $editor->coid));
-            } catch (Throwable $e) {
-                error_log('[CommentNotify] 无法登记评论审核通知。');
-            }
-        }
+        self::html($form, '<h3>' . self::e($title) . '</h3>');
     }
 
-    private static function remember($coid)
+    private static function html($form, string $html): void
     {
-        if ($coid > 0) {
-            self::$comments[$coid] = true;
-            self::registerFlush();
-        }
+        $item = new Typecho_Widget_Helper_Layout('div');
+        $item->html($html);
+        $form->addItem($item);
     }
 
-    public static function registerFlush()
+    private static function toggle($form, string $key, string $label, bool $value, string $description = ''): void
     {
-        $request = Typecho_Request::getInstance();
-        if ($request->is('do=test') && preg_match('~/action/comment-notify/?$~', (string) parse_url($request->getRequestUrl(), PHP_URL_PATH))) {
-            return;
-        }
-        if (!self::$registered) {
-            self::$registered = true;
-            register_shutdown_function(array(__CLASS__, 'flush'));
-        }
+        $form->addInput(new Typecho_Widget_Helper_Form_Element_Select($key, ['0' => '关闭', '1' => '开启'], $value ? '1' : '0', $label, $description));
     }
 
-    public static function queueComment(int $coid): int
+    private static function text($form, string $key, string $label, string $description, string $value): void
     {
-        $db = Typecho_Db::get();
-        $query = $db->select()->from('table.comments')->where('coid = ?', $coid)->limit(1);
-        $row = $db->fetchRow($db->query($query->prepare($query), Typecho_Db::WRITE));
-        $settings = CommentNotify_Service::settings();
-        if (!$row || $row['type'] !== 'comment' || $row['status'] !== 'approved'
-            || ($settings['notify_owner'] !== '1' && (int) $row['authorId'] > 0 && (int) $row['authorId'] === (int) $row['ownerId'])) {
-            return 0;
-        }
-        // Use the real comment widget to resolve rewritten / paged permalinks.
-        $widget = Typecho_Widget::widget('Widget_Abstract_Comments@comment-notify-' . $coid);
-        $widget->push($row);
-        $title = (string) $widget->title;
-        $link = (string) $widget->permalink;
-        $message = "【新评论通知】\n编号：" . $coid
-            . "\n评论者：" . (string) $row['author']
-            . "\n文章标题：《" . $title . "》\n评论内容：" . (string) $row['text']
-            . "\n文章链接：" . $link;
-        return CommentNotify_Service::enqueue($coid, $message, $settings);
-    }
-
-    public static function flush()
-    {
-        // Plugin deactivation must not deliver a previously registered shutdown task.
-        if (!Typecho_Plugin::exists('CommentNotify')) {
-            self::$comments = array();
-            return;
-        }
-        $lastError = error_get_last();
-        if ($lastError && in_array($lastError['type'], array(E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR), true)) {
-            return;
-        }
-        if (function_exists('fastcgi_finish_request')) {
-            fastcgi_finish_request();
-        }
-        $comments = array_keys(self::$comments);
-        self::$comments = array();
-        foreach ($comments as $coid) {
-            try {
-                self::queueComment($coid);
-            } catch (Throwable $e) {
-                error_log('[CommentNotify] 评论通知入队失败，请检查数据库及插件设置。');
-            }
-        }
-        try {
-            CommentNotify_Service::process(4);
-        } catch (Throwable $e) {
-            error_log('[CommentNotify] 通知处理失败，请检查数据库及插件设置。');
-        }
+        $form->addInput(new Typecho_Widget_Helper_Form_Element_Text($key, null, $value, $label, $description));
     }
 
     public static function e($value): string
     {
-        return htmlspecialchars((string) $value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        return htmlspecialchars((string)$value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
     }
 }
 
-/** Typecho fills saved values after config(); keep secrets out of rendered HTML. */
+/** Typecho fills saved values after config(); never render the stored secret. */
 class CommentNotify_Secret extends Typecho_Widget_Helper_Form_Element_Password
 {
     protected function inputValue($value)

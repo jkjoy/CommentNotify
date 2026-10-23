@@ -1,7 +1,7 @@
 <?php
-if (!defined('__TYPECHO_ROOT_DIR__')) {
-    exit;
-}
+declare(strict_types=1);
+
+if (!defined('__TYPECHO_ROOT_DIR__')) { http_response_code(403); exit; }
 require_once __DIR__ . '/Plugin.php';
 
 class CommentNotify_Action extends Widget_Base implements Widget_Interface_Do
@@ -10,73 +10,76 @@ class CommentNotify_Action extends Widget_Base implements Widget_Interface_Do
     {
         $this->response->setHeader('Cache-Control', 'no-store, private');
         $this->response->setHeader('X-Content-Type-Options', 'nosniff');
+        if (!Typecho_Plugin::exists('CommentNotify')) {
+            $this->response->setStatus(404)->throwJson(['ok' => false, 'message' => '评论通知插件未启用。']);
+        }
+        $do = $this->request->get('do', '');
+        if ($do === 'qq_webhook') {
+            comment_notify_qq_webhook_request();
+            return;
+        }
         if (!$this->user->pass('administrator', true)) {
-            $this->response->setStatus(403)->throwJson(array('ok' => false, 'message' => '请以管理员身份登录。'));
+            $this->response->setStatus(403)->throwJson(['ok' => false, 'message' => '请以管理员身份登录。']);
         }
         if (!$this->request->isPost()) {
-            $this->response->setStatus(405)->throwJson(array('ok' => false, 'message' => '请使用 POST 提交操作。'));
+            $this->response->setHeader('Allow', 'POST')->setStatus(405)->throwJson(['ok' => false, 'message' => '请使用 POST 提交操作。']);
         }
         $token = $this->request->get('_');
         if (!is_string($token) || !hash_equals($this->security->getToken($this->request->getReferer()), $token)) {
-            $this->response->setStatus(403)->throwJson(array('ok' => false, 'message' => '表单验证失败，请刷新页面后重试。'));
-        }
-        $do = $this->request->get('do', '');
-        if ($do === 'test') {
-            $this->test();
-            return;
+            $this->response->setStatus(403)->throwJson(['ok' => false, 'message' => '表单验证失败，请刷新页面后重试。']);
         }
         try {
-            if ($do === 'retry') {
-                $id = $this->request->get('id');
-                if (!is_string($id) || !preg_match('/\A[1-9][0-9]{0,9}\z/D', $id)) {
-                    throw new InvalidArgumentException('通知编号无效。');
-                }
-                $changed = CommentNotify_Service::retry((int) $id);
-                $message = $changed ? '已加入重试队列，请刷新查看结果。' : '该记录无需重试或正在发送。';
-            } elseif ($do === 'process') {
-                $result = CommentNotify_Service::process(4);
-                $message = '队列已处理，请查看通知记录。';
-            } else {
-                throw new InvalidArgumentException('操作不存在。');
+            $result = ['ok' => true, 'message' => '状态已更新。'];
+            switch ($do) {
+                case 'test_qq': case 'test_weixin':
+                    $result = comment_notify_test($do === 'test_qq' ? 'qq' : 'weixin');
+                    break;
+                case 'qq_binding_start':
+                    comment_notify_qq_binding_start();
+                    $result['message'] = '绑定码已生成，请向目标 QQ 会话发送下方绑定命令。';
+                    break;
+                case 'qq_binding_cancel':
+                    comment_notify_qq_binding_cancel();
+                    $result['message'] = '绑定码已取消。';
+                    break;
+                case 'weixin_start':
+                    $result = array_merge($result, comment_notify_weixin_start());
+                    break;
+                case 'weixin_check':
+                    $result = array_merge($result, comment_notify_weixin_check($this->text('verify_code')));
+                    break;
+                case 'weixin_sync':
+                    $result = array_merge($result, comment_notify_weixin_sync());
+                    break;
+                case 'weixin_bind':
+                    comment_notify_weixin_bind($this->text('weixin_user_id'));
+                    $result['message'] = '微信接收人已绑定，可开启微信通知并保存。';
+                    break;
+                case 'weixin_disconnect':
+                    comment_notify_weixin_disconnect();
+                    $result['message'] = '微信连接已断开，登录凭证和会话已清除。';
+                    break;
+                case 'status':
+                    break;
+                default:
+                    $this->response->setStatus(400)->throwJson(['ok' => false, 'message' => '操作不存在。']);
             }
-        } catch (InvalidArgumentException $e) {
-            throw new Typecho_Widget_Exception($e->getMessage(), 400);
+            $result['status'] = comment_notify_status();
+        } catch (RuntimeException $exception) {
+            $result = ['ok' => false, 'message' => get_class($exception) === RuntimeException::class
+                ? $exception->getMessage() : '操作失败，请检查数据库和服务器环境。'];
+            try { $result['status'] = comment_notify_status(); } catch (Throwable) {}
+            $this->response->setStatus(400)->throwJson($result);
+        } catch (Throwable) {
+            $this->response->setStatus(502)->throwJson(['ok' => false, 'message' => '操作失败，请检查网络、数据库和服务器环境。']);
         }
-        Typecho_Widget::widget('Widget_Notice')->set($message, 'notice');
-        $this->response->redirect(Helper::url('CommentNotify/manage.php'));
+        $this->response->throwJson($result);
     }
 
-    private function test()
+    private function text(string $name): string
     {
-        try {
-            $kind = $this->request->get('kind');
-            if (!in_array($kind, array('qq', 'wechat'), true)) {
-                throw new InvalidArgumentException('请选择 QQ 或微信通道。');
-            }
-            $input = $this->request->get('settings', array(), $exists);
-            if (!$exists || !is_array($input) || $this->request->get('settings') !== null) {
-                throw new InvalidArgumentException('测试配置格式无效，请刷新插件设置页。');
-            }
-            // Only the explicitly selected test channel can send a message.
-            $input['qq_enabled'] = $kind === 'qq' ? '1' : '0';
-            $input['wechat_enabled'] = $kind === 'wechat' ? '1' : '0';
-            $settings = CommentNotify_Transport::validate(CommentNotify_Plugin::mergeSecrets($input));
-            $results = array();
-            foreach (CommentNotify_Transport::destinations($settings) as $destination) {
-                $destination['message'] = CommentNotify_Transport::prepareMessage('【评论通知测试】' . "\n" . '站点：' . (string) $this->options->title . "\n" . '收到此消息表示该接收目标可以接收评论通知。', $settings['include_links'] === '1');
-                $destination['request_id'] = bin2hex(random_bytes(20));
-                $result = CommentNotify_Transport::send($destination, $settings);
-                $results[] = array('target' => $destination['target'], 'ok' => $result['ok'], 'message' => $result['message']);
-            }
-            $ok = count($results) > 0;
-            foreach ($results as $result) {
-                $ok = $ok && $result['ok'];
-            }
-        } catch (InvalidArgumentException $e) {
-            $this->response->setStatus(400)->throwJson(array('ok' => false, 'message' => $e->getMessage()));
-        } catch (Throwable $e) {
-            $this->response->setStatus(502)->throwJson(array('ok' => false, 'message' => '测试发送失败，请检查机器人服务与通道配置。'));
-        }
-        $this->response->throwJson(array('ok' => $ok, 'message' => $ok ? '测试请求已提交，请确认收到消息后保存设置。' : '部分或全部目标发送失败，请查看各目标结果。', 'results' => $results));
+        $value = $this->request->get($name, '');
+        if (!is_string($value)) { throw new RuntimeException('提交内容格式无效。'); }
+        return trim($value);
     }
 }

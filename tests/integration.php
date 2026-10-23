@@ -1,470 +1,337 @@
 <?php
+/** Real Typecho core, disposable SQLite, and injected HTTP replies only. */
 declare(strict_types=1);
 require __DIR__ . '/bootstrap.php';
+foreach (['pdo_sqlite', 'sodium'] as $extension) {
+    if (!extension_loaded($extension)) { fwrite(STDERR, 'Enable ' . $extension . " to run the isolated tests.\n"); exit(1); }
+}
+require_once dirname(__DIR__) . '/Plugin.php';
 
-foreach (['pdo_sqlite', 'curl'] as $extension) {
-    if (!extension_loaded($extension)) {
-        fwrite(STDERR, 'Enable ' . $extension . " to run the isolated tests.\n");
-        exit(1);
+$checks = [];
+$results = [];
+function check(bool $condition, string $message = 'Assertion failed'): void
+{
+    if (!$condition) { throw new RuntimeException($message); }
+}
+function same(mixed $expected, mixed $actual, string $message = ''): void
+{
+    if ($expected !== $actual) { throw new RuntimeException($message !== '' ? $message : 'Expected ' . var_export($expected, true) . ', got ' . var_export($actual, true)); }
+}
+function raises(callable $callback, string $contains = ''): Throwable
+{
+    try { $callback(); } catch (Throwable $exception) {
+        if ($contains !== '') { check(str_contains($exception->getMessage(), $contains), 'Unexpected error: ' . $exception->getMessage()); }
+        return $exception;
     }
+    throw new RuntimeException('Expected an exception');
+}
+function response(array $data = [], int $status = 200): array { return ['status' => $status, 'data' => $data]; }
+function transport(array &$calls, array $responses): Closure
+{
+    return static function (string $method, string $url, array $headers = [], ?array $payload = null, int $timeout = 6) use (&$calls, &$responses): array {
+        $calls[] = compact('method', 'url', 'headers', 'payload', 'timeout');
+        if ($responses === []) { throw new RuntimeException('Unexpected HTTP request'); }
+        $next = array_shift($responses);
+        if ($next instanceof Throwable) { throw $next; }
+        return $next;
+    };
+}
+function test(string $name, callable $callback): void { $GLOBALS['checks'][$name] = $callback; }
+function fresh(): void
+{
+    $db = notifyTestConnect(':memory:');
+    notifyTestSeed($db);
+    comment_notify_storage_ensure();
+    Typecho_Plugin::init(['activated' => ['CommentNotify' => []], 'handles' => []]);
+    $_POST = [];
+    $_GET = [];
+    $_SERVER['REQUEST_METHOD'] = 'GET';
+}
+function qqConfig(array $changes = []): array
+{
+    return array_replace(comment_notify_defaults(), ['qq_enabled' => true, 'qq_app_id' => '123456', 'qq_app_secret' => 'test-secret', 'qq_target_id' => 'USER_OPENID'], $changes);
+}
+function cachedQQ(array $config, int $expires = 3600, string $token = 'cached-token'): void
+{
+    comment_notify_write('qq_token', ['identity' => hash('sha256', $config['qq_app_id'] . ':' . $config['qq_app_secret']), 'token' => $token, 'expires_at' => time() + $expires]);
+}
+function weixinAccount(string $owner = 'owner@im.wechat'): array
+{
+    $account = ['token' => 'weixin-test-secret', 'account_id' => 'bot@im.bot', 'owner_id' => $owner, 'base_url' => 'https://ilinkai.weixin.qq.com', 'expired' => false];
+    comment_notify_write('weixin_account', $account);
+    return $account;
+}
+function weixinBound(bool $context = true): array
+{
+    weixinAccount();
+    comment_notify_write('weixin_sync', ['candidates' => ['owner@im.wechat'], 'context_tokens' => $context ? ['owner@im.wechat' => 'session-context'] : []]);
+    $config = qqConfig(['weixin_enabled' => true, 'weixin_user_id' => 'owner@im.wechat']);
+    comment_notify_save_config($config);
+    return $config;
+}
+function commentFixture(string $status = 'approved', int $authorId = 0, string $type = 'comment'): int
+{
+    $db = Typecho_Db::get();
+    notifyTestPost($db, 7, ['title' => '真实文章', 'slug' => 'actual-post']);
+    return notifyTestComment($db, ['cid' => 7, 'authorId' => $authorId, 'type' => $type, 'author' => '真实评论人', 'mail' => 'private@example.test', 'ip' => '192.0.2.17', 'text' => '真实评论内容', 'status' => $status]);
+}
+function qqWebhookHeaders(string $raw, ?array $config = null, string $timestamp = '1725442341'): array
+{
+    $config ??= comment_notify_config();
+    // Independent signing, so a self-consistent implementation mistake cannot pass.
+    $secret = $config['qq_app_secret'];
+    $seed = substr(str_repeat($secret, (int)ceil(32 / strlen($secret))), 0, 32);
+    $pair = sodium_crypto_sign_seed_keypair($seed);
+    return ['x-bot-appid' => $config['qq_app_id'], 'x-signature-timestamp' => $timestamp,
+        'x-signature-ed25519' => bin2hex(sodium_crypto_sign_detached($timestamp . $raw, sodium_crypto_sign_secretkey($pair)))];
+}
+function qqWebhookBody(string $event, string $content, string $recipient = 'NEW_USER_OPENID'): array
+{
+    return ['op' => 0, 's' => 1, 'id' => 'event-1', 't' => $event, 'd' => ['id' => 'message-1', 'content' => $content,
+        'author' => ['id' => 'LEGACY_MEMBER_ID', 'user_openid' => $recipient], 'group_openid' => $recipient]];
+}
+function qqWebhookDeliver(array $event, ?int $now = null): array
+{
+    $raw = json_encode($event, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+    return comment_notify_qq_webhook_handle('POST', $raw, qqWebhookHeaders($raw), $now);
+}
+function pushSnapshot(): array
+{
+    return notifyTestSnapshot(Typecho_Db::get());
 }
 
-$directory = sys_get_temp_dir() . '/comment-notify-tests-' . bin2hex(random_bytes(8));
-mkdir($directory, 0700);
-$filename = $directory . '/fixtures.sqlite';
-$db = notifyTestConnect($filename);
-notifyTestSeed($db);
-$gateway = notifyTestStartGateway($directory);
-require_once dirname(__DIR__) . '/Plugin.php';
-CommentNotify_Service::install();
-CommentNotify_Service::install();
-$settings = array_replace(CommentNotify_Transport::defaults(), [
-    'gateway_url' => $gateway['url'], 'gateway_token' => 'PRIVATE-MOCK-GATEWAY-TOKEN',
-    'qq_enabled' => '1', 'qq_account' => 'qq-test-account', 'qq_targets' => 'qqbot:c2c:TEST_OPENID',
-    'wechat_enabled' => '1', 'wechat_account' => 'wechat-test-account', 'wechat_targets' => 'test-user@im.wechat',
-    'qq_service_url' => $gateway['url'], 'qq_service_token' => 'PRIVATE-MOCK-QQ-SERVICE-TOKEN',
-]);
-notifyTestSettings($db, $settings);
-CommentNotify_Plugin::activate();
-Typecho_Plugin::activate('CommentNotify');
+require __DIR__ . '/protocol.php';
 
-register_shutdown_function(static function () use ($gateway, $directory, &$db): void {
-    Typecho_Plugin::deactivate('CommentNotify');
-    proc_terminate($gateway['process']);
-    notifyTestFinishPhp($gateway);
-    Typecho_Widget::destroy();
-    Typecho_Db::set(new Typecho_Db('Pdo_SQLite', 'typecho_'));
-    $db = null;
-    gc_collect_cycles();
-    foreach (glob($directory . '/*') ?: [] as $path) {
-        if (is_file($path)) {
-            unlink($path);
-        }
-    }
-    rmdir($directory);
+test('state storage initializes repeatedly and consumes each exact binding snapshot only once', static function (): void {
+    comment_notify_storage_ensure();
+    $first = ['code' => '0011223344556677', 'target_type' => 'c2c', 'expires_at' => time() + 600, 'identity' => 'first-bot'];
+    comment_notify_write('qq_binding', $first);
+    $snapshot = comment_notify_read('qq_binding');
+    same($first, $snapshot);
+    same(true, comment_notify_state_consume('qq_binding', $snapshot));
+    same([], comment_notify_read('qq_binding'));
+    same(false, comment_notify_state_consume('qq_binding', $snapshot));
+    $replacement = array_replace($first, ['code' => '8899AABBCCDDEEFF']);
+    comment_notify_write('qq_binding', $replacement);
+    same(false, comment_notify_state_consume('qq_binding', $snapshot));
+    same($replacement, comment_notify_read('qq_binding'));
+    same(true, comment_notify_state_consume('qq_binding', $replacement));
+    same([], comment_notify_read('qq_binding'));
 });
 
-function notifyTestRows(Typecho_Db $db): array
-{
-    return $db->fetchAll($db->select()->from(CommentNotify_Service::TABLE)->order('id', Typecho_Db::SORT_ASC));
-}
+test('QQ target binding preserves newer unrelated settings and rejects changed credentials or targets', static function (): void {
+    $snapshot = qqConfig();
+    comment_notify_save_config($snapshot);
+    $newer = array_replace($snapshot, ['include_link' => false, 'notify_admin' => true]);
+    comment_notify_save_config($newer);
+    same(true, comment_notify_qq_save_bound_target($snapshot, 'BOUND_OPENID'));
+    same(array_replace($newer, ['qq_target_id' => 'BOUND_OPENID']), comment_notify_config());
+    $boundSnapshot = comment_notify_config();
+    $changedCredentials = array_replace($boundSnapshot, ['qq_app_secret' => 'new-bot-secret']);
+    comment_notify_save_config($changedCredentials);
+    same(false, comment_notify_qq_save_bound_target($boundSnapshot, 'STALE_OPENID'));
+    same($changedCredentials, comment_notify_config());
+    $changedTarget = array_replace($changedCredentials, ['qq_target_id' => 'MANUAL_OPENID']);
+    comment_notify_save_config($changedTarget);
+    same(false, comment_notify_qq_save_bound_target($changedCredentials, 'STALE_OPENID'));
+    same($changedTarget, comment_notify_config());
+});
 
-function notifyTestReset(Typecho_Db $db, array $settings, string $directory): void
-{
-    // Drain remembered hook IDs before deleting fixtures; preserve the plugin's real hooks.
-    CommentNotify_Plugin::flush();
-    foreach ([CommentNotify_Service::TABLE, 'table.comments', 'table.contents'] as $table) {
-        $db->query($db->delete($table));
-    }
-    notifyTestSettings($db, $settings);
-    notifyTestPost($db);
-    notifyTestScenario($directory, 'success');
-    file_put_contents($directory . '/requests.jsonl', '');
-}
-
-function notifyTestSetRow(Typecho_Db $db, int $id, array $changes): void
-{
-    $db->query($db->update(CommentNotify_Service::TABLE)->rows($changes)->where('id = ?', $id));
-}
-
-$tests = [];
-$tests['real Typecho portal, hooks and safe password controls'] = static function () use ($settings): void {
+test('Typecho portal registers only the two new-comment hooks and official action', static function (): void {
     [$path, $class] = Typecho_Plugin::portal('CommentNotify', __TYPECHO_ROOT_DIR__ . __TYPECHO_PLUGIN_DIR__);
-    notifyTestSame(realpath(dirname(__DIR__) . '/Plugin.php'), realpath($path), 'Discover the standalone plugin entry');
-    notifyTestAssert(is_a($class, Typecho_Plugin_Interface::class, true), 'Implement the real Typecho plugin interface');
-    $hooks = Typecho_Plugin::export()['handles'];
-    foreach (['Widget_Feedback:finishComment', 'Widget_Comments_Edit:finishComment', 'Widget_Comments_Edit:mark',
-        'index.php:begin', 'admin/common.php:begin'] as $hook) {
-        notifyTestAssert(!empty($hooks[$hook]), 'Register hook ' . $hook);
+    same(realpath(dirname(__DIR__) . '/Plugin.php'), realpath($path));
+    check(is_a($class, Typecho_Plugin_Interface::class, true));
+    Typecho_Plugin::init(['activated' => [], 'handles' => []]);
+    CommentNotify_Plugin::activate();
+    Typecho_Plugin::activate('CommentNotify');
+    $hooks = array_keys(Typecho_Plugin::export()['handles']);
+    sort($hooks);
+    same(['Widget_Comments_Edit:finishComment', 'Widget_Feedback:finishComment'], $hooks);
+    $db = Typecho_Db::get();
+    $row = $db->fetchRow($db->select('value')->from('table.options')->where('name = ?', 'actionTable')->where('user = ?', 0));
+    check(str_contains($row['value'], 'comment-notify') && str_contains($row['value'], 'CommentNotify_Action'));
+    same([], $db->fetchAll("SELECT name FROM sqlite_master WHERE name = 'typecho_comment_notify_queue'"));
+});
+
+test('legacy gateway configuration and malformed storage cannot enable direct notifications', static function (): void {
+    $db = Typecho_Db::get();
+    foreach ([['qq_enabled' => '1', 'qq_account' => 'old', 'qq_targets' => 'old-target', 'gateway_token' => 'old-secret'],
+        ['qq_enabled' => true, 'qq_app_id' => '123456', 'qq_app_secret' => 'test-secret', 'qq_target_id' => 'USER_OPENID'],
+        ['protocol_version' => 1, 'qq_enabled' => true], ['protocol_version' => 2, 'qq_enabled' => [], 'qq_app_id' => [], 'qq_target_type' => []]] as $legacy) {
+        notifyTestSettings($db, $legacy);
+        same(false, comment_notify_config()['qq_enabled']);
+        same(false, comment_notify_config()['weixin_enabled']);
+        check(!isset(comment_notify_config()['gateway_token']));
     }
+    $db->query($db->update('table.options')->rows(['value' => 'not-json'])->where('name = ?', 'plugin:CommentNotify')->where('user = ?', 0));
+    same(comment_notify_defaults(), comment_notify_config());
+});
+
+test('configuration reads fresh saved state without leaking private account state', static function (): void {
+    $config = qqConfig();
+    comment_notify_save_config($config);
+    same($config, comment_notify_config());
+    notifyTestSettings(Typecho_Db::get(), array_replace($config, ['qq_target_id' => 'NEW_OPENID']));
+    same('NEW_OPENID', comment_notify_config()['qq_target_id']);
+    weixinBound();
+    cachedQQ($config);
+    $status = json_encode(comment_notify_status(), JSON_THROW_ON_ERROR);
+    foreach (['test-secret', 'weixin-test-secret', 'cached-token', 'session-context'] as $secret) {
+        check(!str_contains($status, $secret), 'Status exposed ' . $secret);
+    }
+});
+
+test('validation rejects malformed values and preserves only intentional secret updates', static function (): void {
+    $result = comment_notify_validate(['qq_enabled' => '1', 'qq_app_id' => [], 'qq_app_secret' => ['bad'], 'qq_target_id' => ['bad'], 'qq_target_type' => ['c2c'], 'notify_pending' => '1'], comment_notify_defaults());
+    check(count($result['errors']) >= 2);
+    same('', $result['config']['qq_app_id']);
+    $input = ['qq_app_id' => '123456', 'qq_target_type' => 'c2c', 'qq_target_id' => 'USER_OPENID', 'notify_pending' => '1', 'qq_app_secret' => ''];
+    same('test-secret', comment_notify_validate($input, qqConfig())['config']['qq_app_secret']);
+    $input['qq_app_secret'] = 'replacement-secret';
+    same('replacement-secret', comment_notify_validate($input, qqConfig())['config']['qq_app_secret']);
+    $result = comment_notify_validate(['qq_target_type' => 'c2c', 'notify_pending' => '1', 'weixin_user_id' => 'attacker@im.wechat'], qqConfig(['weixin_user_id' => 'owner@im.wechat']));
+    same('owner@im.wechat', $result['config']['weixin_user_id']);
+});
+
+test('QQ credential changes invalidate access token while unrelated changes preserve it', static function (): void {
+    $config = qqConfig();
+    comment_notify_save_config($config);
+    cachedQQ($config);
+    comment_notify_save_config(array_replace($config, ['include_link' => false]));
+    same('cached-token', comment_notify_read('qq_token')['token']);
+    comment_notify_save_config(array_replace($config, ['qq_app_secret' => 'new-secret']));
+    same([], comment_notify_read('qq_token'));
+});
+
+test('test notifications use saved settings and ignore unsaved request fields', static function (): void {
+    $config = qqConfig(['qq_enabled' => false]);
+    comment_notify_save_config($config);
+    cachedQQ($config);
+    $_POST = ['qq_target_id' => 'UNSAVED_OPENID', 'settings' => ['qq_target_id' => 'UNSAVED_OPENID', 'qq_app_secret' => 'unsaved-secret']];
+    $calls = [];
+    $result = comment_notify_test('qq', transport($calls, [response(['id' => 'ok'])]));
+    same(true, $result['ok']);
+    same(1, count($calls));
+    same('https://api.bot.qq.com/v2/users/USER_OPENID/messages', $calls[0]['url']);
+    same(['Authorization: QQBot cached-token'], $calls[0]['headers']);
+    same($config, comment_notify_config());
+});
+
+test('committed ordinary comments use real Typecho article and public comment content', static function (): void {
+    $config = qqConfig();
+    comment_notify_save_config($config);
+    cachedQQ($config);
+    $coid = commentFixture();
+    $calls = [];
+    comment_notify_comment_created($coid, transport($calls, [response(['id' => 'ok'])]));
+    same(1, count($calls));
+    $text = $calls[0]['payload']['content'];
+    foreach (['真实文章', '真实评论人', '真实评论内容', '/archives/7/#comment-' . $coid] as $value) { check(str_contains($text, $value), 'Notification missing ' . $value . ': ' . $text); }
+    foreach (['private@example.test', '192.0.2.17'] as $private) { check(!str_contains($text, $private)); }
+    same(true, comment_notify_read('result_qq')['ok']);
+});
+
+test('waiting comments follow pending setting; approved follows approved setting', static function (): void {
+    foreach ([['waiting', 'notify_pending', '#comments'], ['approved', 'notify_approved', '#comment-']] as [$status, $flag, $anchor]) {
+        foreach ([false, true] as $enabled) {
+            fresh();
+            $config = qqConfig([$flag => $enabled]);
+            comment_notify_save_config($config);
+            cachedQQ($config);
+            $coid = commentFixture($status);
+            $calls = [];
+            comment_notify_comment_created($coid, transport($calls, $enabled ? [response(['id' => 'ok'])] : []));
+            same($enabled ? 1 : 0, count($calls), 'Incorrect filter: ' . $status);
+            if ($enabled) { check(str_contains($calls[0]['payload']['content'], $anchor)); }
+        }
+    }
+});
+
+test('disabled channels, spam, trackbacks, missing comments and registered authors do not send', static function (): void {
+    foreach ([['spam', 0, 'comment', []], ['approved', 4, 'comment', []], ['approved', 0, 'trackback', []],
+        ['approved', 0, 'comment', ['qq_enabled' => false]]] as [$status, $author, $type, $changes]) {
+        fresh();
+        comment_notify_save_config(qqConfig($changes));
+        $coid = commentFixture($status, $author, $type);
+        $calls = [];
+        comment_notify_comment_created($coid, transport($calls, []));
+        comment_notify_comment_created(99999999, transport($calls, []));
+        same([], $calls);
+    }
+});
+
+test('registered-author opt-in and include-link option change notification behavior', static function (): void {
+    $config = qqConfig(['notify_admin' => true, 'include_link' => false]);
+    comment_notify_save_config($config);
+    cachedQQ($config);
+    $coid = commentFixture('approved', 4);
+    $calls = [];
+    comment_notify_comment_created($coid, transport($calls, [response(['id' => 'ok'])]));
+    same(1, count($calls));
+    check(!str_contains($calls[0]['payload']['content'], 'https://comment-notify-test.invalid/archives/'));
+});
+
+test('one failed direct channel does not prevent the other and results record failures', static function (): void {
+    $config = weixinBound();
+    cachedQQ($config);
+    $coid = commentFixture();
+    $calls = [];
+    comment_notify_comment_created($coid, transport($calls, [response(['err_code' => 40034105]), response(['ret' => 0])]));
+    same(2, count($calls));
+    same(false, comment_notify_read('result_qq')['ok']);
+    same(true, comment_notify_read('result_weixin')['ok']);
+    check(str_ends_with($calls[1]['url'], '/ilink/bot/sendmessage'));
+});
+
+test('Typecho settings render saved identities safely and never expose saved secrets', static function (): void {
+    $config = weixinBound();
+    cachedQQ($config);
+    comment_notify_write('weixin_account', array_replace(comment_notify_read('weixin_account'), ['account_id' => '<script>alert(1)</script>']));
     $form = new Typecho_Widget_Helper_Form();
-    $class::config($form);
-    foreach (['gateway_token', 'qq_service_token'] as $key) {
-        $form->getInput($key)->value($settings[$key]); // The core applies saved values after config().
-    }
+    CommentNotify_Plugin::config($form);
+    $form->getInput('qq_app_secret')->value($config['qq_app_secret']);
     ob_start();
-    $form->render();
-    $html = ob_get_clean();
-    foreach (['gateway_token', 'qq_service_token'] as $key) {
-        notifyTestAssert(!str_contains($html, $settings[$key]), 'Saved credentials must not appear in HTML');
-        notifyTestAssert((bool) preg_match('/<input[^>]*name="' . $key . '"[^>]*type="password"[^>]*value=""/', $html),
-            'Render a blank password field for ' . $key);
-    }
-};
+    try { $form->render(); $html = (string)ob_get_contents(); }
+    finally { ob_end_clean(); }
+    foreach (['test-secret', 'weixin-test-secret', 'cached-token', 'session-context'] as $secret) { check(!str_contains($html, $secret), 'Saved secret was rendered: ' . $secret); }
+    check(!str_contains($html, '<script>alert(1)</script>'));
+    check((bool)preg_match('/<input[^>]*name="qq_app_secret"[^>]*type="password"[^>]*value=""/', $html));
+    foreach (['gateway_url', 'qq_service_url', 'qq_targets', 'wechat_targets'] as $old) { check(!str_contains($html, 'name="' . $old . '"')); }
+});
 
-$tests['only approved ordinary comments from visitors are queued'] = static function () use ($db): void {
-    foreach ([['status' => 'waiting'], ['status' => 'spam'], ['type' => 'trackback'],
-        ['authorId' => 1, 'ownerId' => 1]] as $overrides) {
-        notifyTestSame(0, CommentNotify_Plugin::queueComment(notifyTestComment($db, $overrides)), 'Skip ineligible comment');
-    }
-    notifyTestSame(0, CommentNotify_Plugin::queueComment(999999), 'Ignore a missing comment');
-    notifyTestSame([], notifyTestRows($db), 'No ineligible comments reach the queue');
-    $coid = notifyTestComment($db);
-    notifyTestSame(2, CommentNotify_Plugin::queueComment($coid), 'Create independent QQ and WeChat jobs');
-    notifyTestSame(0, CommentNotify_Plugin::queueComment($coid), 'Deduplicate repeated finish hooks');
-};
-
-$tests['author notification can be explicitly enabled'] = static function () use ($db, $settings): void {
-    notifyTestSettings($db, array_replace($settings, ['notify_owner' => '1']));
-    notifyTestSame(2, CommentNotify_Plugin::queueComment(notifyTestComment($db, ['authorId' => 1])),
-        'Allow the author when the administrator enables it');
-};
-
-$tests['moderation hook waits for the committed database status'] = static function () use ($db, $directory): void {
-    $coid = notifyTestComment($db, ['status' => 'waiting']);
-    $before = $db->fetchRow($db->select()->from('table.comments')->where('coid = ?', $coid));
-    CommentNotify_Plugin::mark($before, (object) ['coid' => $coid], 'approved');
-    notifyTestSame([], notifyTestRows($db), 'The pre-update mark hook only remembers the ID');
-    notifyTestSame([], notifyTestRequests($directory), 'A pre-update mark hook does not deliver');
-    $db->query($db->update('table.comments')->rows(['status' => 'approved'])->where('coid = ?', $coid));
-    CommentNotify_Plugin::flush();
-    notifyTestSame(['sent', 'sent'], array_column(notifyTestRows($db), 'state'), 'Read the approved row after the update');
-    CommentNotify_Plugin::mark($before, (object) ['coid' => $coid], 'approved');
-    $db->query($db->update('table.comments')->rows(['status' => 'waiting'])->where('coid = ?', $coid));
-    CommentNotify_Plugin::flush();
-    notifyTestSame(2, count(notifyTestRequests($directory)), 'A later unapproved state never causes another notification');
-};
-
-$tests['finish hooks reread the database instead of trusting widget status'] = static function () use ($db): void {
-    $coid = notifyTestComment($db, ['status' => 'waiting']);
-    CommentNotify_Plugin::finishComment((object) ['coid' => $coid, 'status' => 'approved']);
-    CommentNotify_Plugin::flush();
-    notifyTestSame([], notifyTestRows($db), 'A forged or stale widget cannot bypass moderation');
-    $db->query($db->update('table.comments')->rows(['status' => 'approved'])->where('coid = ?', $coid));
-    CommentNotify_Plugin::finishComment((object) ['coid' => $coid]);
-    CommentNotify_Plugin::flush();
-    notifyTestSame(['sent', 'sent'], array_column(notifyTestRows($db), 'state'), 'Approved finish hook sends once per destination');
-};
-
-$tests['the real Typecho moderation path defers notifications until after its UPDATE'] = static function () use ($db, $directory): void {
-    $coid = notifyTestComment($db, ['status' => 'waiting']);
-    $user = Typecho_Widget::widget('Widget_User');
-    notifyTestAssert($user->simpleLogin(['uid' => 1, 'name' => 'isolated-admin', 'screenName' => '测试管理员',
-        'mail' => 'admin@example.invalid', 'url' => '', 'group' => 'administrator', 'authCode' => 'isolated-auth'], true),
-        'Authenticate through the real core user widget');
-    $editor = Typecho_Widget::widget('Widget_Comments_Edit');
-    $mark = new ReflectionMethod($editor, 'mark');
-    if (PHP_VERSION_ID < 80100) {
-        $mark->setAccessible(true);
-    }
-    notifyTestAssert($mark->invoke($editor, $coid, 'approved'), 'The real core approves a waiting comment');
-    notifyTestSame('approved', $db->fetchRow($db->select('status')->from('table.comments')->where('coid = ?', $coid))['status'],
-        'The real Typecho mark method committed its UPDATE');
-    notifyTestSame([], notifyTestRows($db), 'The hook does not enqueue while the old waiting state is visible');
-    notifyTestSame([], notifyTestRequests($directory), 'Moderation does not block on outgoing notifications');
-    CommentNotify_Plugin::flush();
-    notifyTestSame(['sent', 'sent'], array_column(notifyTestRows($db), 'state'), 'Deferred processing sees the committed approved state');
-};
-
-$tests['OpenClaw sends a Bearer-authenticated message tool request with account IDs'] = static function () use ($db, $directory, $settings): void {
-    $coid = notifyTestComment($db);
-    CommentNotify_Service::enqueue($coid, '<b>访客</b> &amp; 中文 😀');
-    $stats = CommentNotify_Service::process();
-    notifyTestSame(2, $stats['sent'], 'Both platforms confirm delivery');
-    $requests = notifyTestRequests($directory);
-    notifyTestSame(2, count($requests), 'Send exactly one request per platform');
-    foreach ($requests as $index => $request) {
-        $kind = $index === 0 ? 'qq' : 'wechat';
-        notifyTestSame('/tools/invoke', $request['path'], 'Use the OpenClaw tool API');
-        notifyTestSame('Bearer ' . $settings['gateway_token'], $request['authorization'], 'Use a Bearer token');
-        notifyTestSame('message', $request['body']['tool'], 'Invoke message without an agent turn');
-        notifyTestSame('send', $request['body']['args']['action'], 'Use message send');
-        notifyTestSame($settings[$kind . '_channel'], $request['body']['args']['channel'], 'Select the correct channel');
-        notifyTestSame($settings[$kind . '_account'], $request['body']['args']['accountId'], 'Select the correct accountId');
-        notifyTestSame($settings[$kind . '_targets'], $request['body']['args']['target'], 'Keep the recipient platform specific');
-        notifyTestSame('访客 & 中文 😀', $request['body']['args']['message'], 'Send cleaned UTF-8 text');
-    }
-    notifyTestSame(0, CommentNotify_Service::enqueue($coid, '编辑后的文本'), 'Sending retains the original deduplication key');
-    CommentNotify_Service::process();
-    notifyTestSame(2, count(notifyTestRequests($directory)), 'Sent jobs are never automatically sent again');
-    foreach (CommentNotify_Service::rows() as $row) {
-        notifyTestAssert(!isset($row['envelope'], $row['config_hash'], $row['event_key'], $row['lock_token']), 'List only public queue metadata');
-    }
-    $database = json_encode(notifyTestRows($db), JSON_THROW_ON_ERROR);
-    notifyTestAssert(!str_contains($database, $settings['gateway_token']) && !str_contains($database, $settings['qq_service_token']),
-        'Queue snapshots never persist credentials');
-};
-
-$tests['multiple recipients have independent deduplicated jobs'] = static function () use ($db, $settings): void {
-    $settings['qq_targets'] .= "\nqqbot:group:TEST_GROUP\nqqbot:c2c:TEST_OPENID";
-    $settings['wechat_targets'] .= "\nsecond-user@im.wechat";
-    notifyTestSettings($db, $settings);
-    $coid = notifyTestComment($db);
-    notifyTestSame(4, CommentNotify_Service::enqueue($coid, '多目标通知'), 'Create one row per distinct recipient');
-    notifyTestSame(0, CommentNotify_Service::enqueue($coid, '多目标通知'), 'Dedupe each recipient independently');
-    notifyTestSame(4, CommentNotify_Service::process()['sent'], 'Send all distinct jobs');
-};
-
-$tests['a QQ rejection does not prevent the WeChat delivery'] = static function () use ($db, $directory): void {
-    notifyTestScenario($directory, 'fail-qq');
-    CommentNotify_Service::enqueue(notifyTestComment($db), '分别投递');
-    $stats = CommentNotify_Service::process();
-    notifyTestSame(1, $stats['sent'], 'WeChat still succeeds');
-    notifyTestSame(1, $stats['failed'], 'QQ failure is reported independently');
-    notifyTestSame(['pending', 'sent'], array_column(notifyTestRows($db), 'state'), 'Keep the unsuccessful destination pending only');
-};
-
-$tests['explicit failures back off and stop after five attempts'] = static function () use ($db, $settings, $directory): void {
-    notifyTestSettings($db, array_replace($settings, ['wechat_enabled' => '0']));
-    notifyTestScenario($directory, 'business-error');
-    CommentNotify_Service::enqueue(notifyTestComment($db), '受限重试');
-    $id = (int) notifyTestRows($db)[0]['id'];
-    $requestId = json_decode(notifyTestRows($db)[0]['envelope'], true)['request_id'];
-    for ($attempt = 1; $attempt <= 5; ++$attempt) {
-        $before = time();
-        notifyTestSame(1, CommentNotify_Service::process()['failed'], 'Count each explicit failure');
-        $row = notifyTestRows($db)[0];
-        notifyTestSame($attempt, (int) $row['attempts'], 'Increment persisted attempts');
-        notifyTestSame($attempt === 5 ? 'failed' : 'pending', $row['state'], 'Stop after the fifth rejection');
-        if ($attempt < 5) {
-            notifyTestAssert((int) $row['next_at'] >= $before + 60 * (2 ** ($attempt - 1)), 'Apply exponential backoff');
-            notifyTestSame(0, CommentNotify_Service::process()['failed'], 'Do not retry before the backoff expires');
-            notifyTestSetRow($db, $id, ['next_at' => time() - 1]);
+test('Action requires administrator, POST, CSRF, and enabled plugin before mutations', static function (): void {
+    $operations = ['test_qq', 'test_weixin', 'qq_binding_start', 'qq_binding_cancel', 'weixin_start', 'weixin_check', 'weixin_sync', 'weixin_bind', 'weixin_disconnect', 'status'];
+    foreach (['anonymous' => 403, 'contributor' => 403, 'get' => 405, 'csrf' => 403, 'disabled' => 404] as $mode => $expectedStatus) {
+        foreach ($mode === 'disabled' ? array_merge($operations, ['qq_webhook']) : $operations as $operation) {
+            $worker = notifyTestFinishPhp(notifyTestStartPhp([__DIR__ . '/action-worker.php', $mode, $operation]));
+            same(0, $worker['code'], $mode . '/' . $operation . ': ' . $worker['stderr']);
+            $json = json_decode($worker['stdout'], true);
+            check(is_array($json) && ($json['ok'] ?? null) === false, $mode . '/' . $operation . ' was accepted: ' . $worker['stdout']);
+            check(str_contains($worker['stderr'], 'STATUS:' . $expectedStatus), $mode . '/' . $operation . ': ' . $worker['stderr']);
+            check(str_contains($worker['stderr'], 'UNCHANGED:yes'), 'Rejected request changed persisted state');
         }
     }
-    CommentNotify_Service::process();
-    notifyTestSame(5, count(notifyTestRequests($directory)), 'Never exceed five automatic attempts');
-    foreach (notifyTestRequests($directory) as $request) {
-        notifyTestSame($requestId, $request['body']['idempotencyKey'], 'Preserve a stable idempotency key across retries');
-    }
-};
+});
 
-foreach (['nested-error', 'text-error', 'http-rejected'] as $scenario) {
-    $tests['recognize definite rejection: ' . $scenario] = static function () use ($db, $settings, $directory, $scenario): void {
-        notifyTestSettings($db, array_replace($settings, ['wechat_enabled' => '0']));
-        notifyTestScenario($directory, $scenario);
-        CommentNotify_Service::enqueue(notifyTestComment($db), '错误识别');
-        $stats = CommentNotify_Service::process();
-        notifyTestSame(1, $stats['failed'], 'A business error must never be marked sent');
-        notifyTestSame('pending', notifyTestRows($db)[0]['state'], 'Only a definite rejection may be retried automatically');
-        notifyTestAssert(!str_contains(notifyTestRows($db)[0]['error'], 'PRIVATE-MOCK'), 'Never expose remote credentials in a stored error');
-    };
+test('Action rejects unsupported operation and returns sanitized administrator status', static function (): void {
+    foreach (['unknown', 'status'] as $operation) {
+        $worker = notifyTestFinishPhp(notifyTestStartPhp([__DIR__ . '/action-worker.php', 'admin', $operation]));
+        same(0, $worker['code'], $worker['stderr']);
+        $json = json_decode($worker['stdout'], true);
+        same($operation === 'status', $json['ok'] ?? null);
+        foreach (['test-secret', 'weixin-test-secret', 'cached-token', 'session-context'] as $secret) { check(!str_contains($worker['stdout'], $secret)); }
+        check(str_contains($worker['stderr'], 'UNCHANGED:yes'));
+    }
+});
+
+foreach ($checks as $name => $callback) {
+    fresh();
+    $level = ob_get_level();
+    ob_start();
+    try { $callback(); $results[] = 'PASS ' . $name; }
+    catch (Throwable $exception) { $results[] = 'FAIL ' . $name . "\n     " . get_class($exception) . ': ' . $exception->getMessage() . ' at ' . basename($exception->getFile()) . ':' . $exception->getLine(); }
+    finally { while (ob_get_level() > $level) { ob_end_clean(); } }
 }
-
-foreach (['empty', 'malformed', 'http-error', 'timeout'] as $scenario) {
-    $tests['ambiguous delivery requires manual review: ' . $scenario] = static function () use ($db, $settings, $directory, $scenario): void {
-        notifyTestSettings($db, array_replace($settings, ['wechat_enabled' => '0']));
-        notifyTestScenario($directory, $scenario);
-        CommentNotify_Service::enqueue(notifyTestComment($db), '请核实机器人是否收到');
-        notifyTestSame(1, CommentNotify_Service::process()['uncertain'], 'Persist ambiguous network/server responses');
-        notifyTestSame('uncertain', notifyTestRows($db)[0]['state'], 'Require a manual decision after an ambiguous send');
-        CommentNotify_Service::process();
-        CommentNotify_Service::process();
-        notifyTestSame(1, count(notifyTestRequests($directory)), 'Never automatically repeat an ambiguous delivery');
-    };
-}
-
-$tests['expired worker leases become uncertain without automatic redelivery'] = static function () use ($db, $settings, $directory): void {
-    notifyTestSettings($db, array_replace($settings, ['wechat_enabled' => '0']));
-    CommentNotify_Service::enqueue(notifyTestComment($db), '过期发送进程');
-    $id = (int) notifyTestRows($db)[0]['id'];
-    notifyTestSetRow($db, $id, ['state' => 'sending', 'lock_at' => time() - 121, 'lock_token' => 'dead-worker', 'attempts' => 1]);
-    notifyTestSame(1, CommentNotify_Service::process()['uncertain'], 'Recognize an interrupted sending worker');
-    notifyTestSame('uncertain', notifyTestRows($db)[0]['state'], 'Do not reclaim an expired lease for redelivery');
-    notifyTestSame([], notifyTestRequests($directory), 'No network request occurs for a crashed worker lease');
-};
-
-$tests['two real PHP workers cannot deliver the same claimed job'] = static function () use ($db, $settings, $directory, $filename): void {
-    notifyTestSettings($db, array_replace($settings, ['wechat_enabled' => '0']));
-    notifyTestScenario($directory, 'slow');
-    CommentNotify_Service::enqueue(notifyTestComment($db), '竞争发送');
-    $first = notifyTestStartPhp([__DIR__ . '/process-worker.php', $filename, '1']);
-    $second = notifyTestStartPhp([__DIR__ . '/process-worker.php', $filename, '1']);
-    foreach ([$first, $second] as $worker) {
-        $result = notifyTestFinishPhp($worker);
-        notifyTestSame(0, $result['code'], 'Concurrent worker completes: ' . $result['stderr']);
-        notifyTestAssert(is_array(json_decode($result['stdout'], true)), 'Worker returns delivery statistics');
-    }
-    notifyTestSame(1, count(notifyTestRequests($directory)), 'An atomic lease allows exactly one outgoing request');
-    notifyTestSame('sent', notifyTestRows($db)[0]['state'], 'The winning worker commits success');
-    notifyTestSame(1, (int) notifyTestRows($db)[0]['attempts'], 'Only the lease owner consumes an attempt');
-};
-
-$tests['gateway, recipient and account changes cancel stale jobs without disclosing tokens'] = static function () use ($db, $settings, $directory): void {
-    foreach ([['gateway_url' => $settings['gateway_url'] . '/new-server'], ['qq_targets' => 'qqbot:c2c:NEW_OPENID'],
-        ['qq_account' => 'another-account'], ['qq_enabled' => '0']] as $change) {
-        $db->query($db->delete(CommentNotify_Service::TABLE));
-        $original = array_replace($settings, ['wechat_enabled' => '0']);
-        notifyTestSettings($db, $original);
-        CommentNotify_Service::enqueue(notifyTestComment($db), '不能转移旧任务');
-        notifyTestSettings($db, array_replace($original, $change));
-        notifyTestSame(1, CommentNotify_Service::process()['cancelled'], 'Cancel jobs whose destination snapshot no longer matches');
-        notifyTestSame('cancelled', notifyTestRows($db)[0]['state'], 'Persist cancellation');
-        notifyTestAssert(!CommentNotify_Service::retry((int) notifyTestRows($db)[0]['id']), 'Do not retry cancelled jobs');
-    }
-    notifyTestSame([], notifyTestRequests($directory), 'Never send an old token to a changed gateway or recipient');
-};
-
-$tests['manual retry preserves the original request ID and rejects changed destinations'] = static function () use ($db, $settings, $directory): void {
-    notifyTestSettings($db, array_replace($settings, ['wechat_enabled' => '0']));
-    notifyTestScenario($directory, 'empty');
-    CommentNotify_Service::enqueue(notifyTestComment($db), '人工核实后重试');
-    CommentNotify_Service::process();
-    $row = notifyTestRows($db)[0];
-    $id = (int) $row['id'];
-    $requestId = json_decode($row['envelope'], true)['request_id'];
-    notifyTestSettings($db, array_replace($settings, ['wechat_enabled' => '0', 'qq_targets' => 'qqbot:c2c:NEW_OPENID']));
-    notifyTestAssert(!CommentNotify_Service::retry($id), 'A manual retry cannot redirect an existing notification');
-    notifyTestSettings($db, array_replace($settings, ['wechat_enabled' => '0']));
-    notifyTestAssert(CommentNotify_Service::retry($id), 'Allow deliberate retry after the administrator checks delivery');
-    notifyTestScenario($directory, 'success');
-    notifyTestSame(1, CommentNotify_Service::process()['sent'], 'Manual retry can complete');
-    notifyTestSame($requestId, notifyTestRequests($directory)[1]['body']['idempotencyKey'], 'Use the original idempotency key after manual retry');
-};
-
-$tests['moderated or deleted comments are cancelled immediately before sending'] = static function () use ($db, $settings, $directory): void {
-    notifyTestSettings($db, array_replace($settings, ['wechat_enabled' => '0']));
-    $coid = notifyTestComment($db);
-    CommentNotify_Service::enqueue($coid, '审核状态发生变化');
-    $db->query($db->update('table.comments')->rows(['status' => 'spam'])->where('coid = ?', $coid));
-    notifyTestSame(1, CommentNotify_Service::process()['cancelled'], 'Cancel a comment that is no longer approved');
-    $coid = notifyTestComment($db);
-    CommentNotify_Service::enqueue($coid, '评论被删除');
-    $db->query($db->delete('table.comments')->where('coid = ?', $coid));
-    notifyTestSame(1, CommentNotify_Service::process()['cancelled'], 'Cancel a deleted comment');
-    notifyTestSame([], notifyTestRequests($directory), 'Never deliver comments that fail the final database check');
-};
-
-$tests['a cancelled comment may notify once when it is approved again'] = static function () use ($db, $settings, $directory): void {
-    notifyTestSettings($db, array_replace($settings, ['wechat_enabled' => '0']));
-    $coid = notifyTestComment($db);
-    CommentNotify_Service::enqueue($coid, '第一次审核');
-    $first = notifyTestRows($db)[0];
-    $db->query($db->update('table.comments')->rows(['status' => 'waiting'])->where('coid = ?', $coid));
-    notifyTestSame(1, CommentNotify_Service::process()['cancelled'], 'Cancel a job when its comment returns to moderation');
-    $db->query($db->update('table.comments')->rows(['status' => 'approved'])->where('coid = ?', $coid));
-    notifyTestSame(1, CommentNotify_Service::enqueue($coid, '再次审核通过'), 'A new approved event may restore an unsent cancelled job');
-    notifyTestSame((int) $first['id'], (int) notifyTestRows($db)[0]['id'], 'Keep one durable row for this comment and recipient');
-    notifyTestSame(1, CommentNotify_Service::process()['sent'], 'Notify the newly approved comment');
-    notifyTestSame(0, CommentNotify_Service::enqueue($coid, '不能再发'), 'A successful delivery cannot be restored again');
-    notifyTestSame(1, count(notifyTestRequests($directory)), 'The recipient receives exactly one successful notification');
-};
-
-$tests['QQ service remains compatible with /api/notifications'] = static function () use ($db, $settings, $directory): void {
-    notifyTestSettings($db, array_replace($settings, ['qq_provider' => 'service', 'qq_targets' => 'owner', 'wechat_enabled' => '0']));
-    foreach (['service-queued', 'service-sent'] as $scenario) {
-        notifyTestScenario($directory, $scenario);
-        CommentNotify_Service::enqueue(notifyTestComment($db), '旧版 QQ 服务兼容');
-        notifyTestSame(1, CommentNotify_Service::process()['sent'], 'Accept a confirmed QQ service response');
-    }
-    foreach (notifyTestRequests($directory) as $request) {
-        notifyTestSame('/api/notifications', $request['path'], 'Keep the Enhancement QQ service endpoint');
-        notifyTestSame('Bearer ' . $settings['qq_service_token'], $request['authorization'], 'Use the QQ service credential only');
-        notifyTestSame(['owner'], $request['body']['targets'], 'Send a single bound service alias');
-        notifyTestSame('旧版 QQ 服务兼容', $request['body']['message'], 'Keep the legacy message field');
-        notifyTestAssert(isset($request['body']['idempotency_key']), 'Keep the legacy idempotency key field');
-    }
-};
-
-$tests['Unicode truncation and link suppression produce valid bounded text'] = static function (): void {
-    $text = CommentNotify_Transport::prepareMessage(str_repeat('中文😀', 400));
-    notifyTestAssert(strlen($text) <= 1800, 'Respect the QQ 1800-byte limit');
-    notifyTestAssert((bool) preg_match('//u', $text), 'Never cut a UTF-8 code point');
-    notifyTestAssert(str_ends_with($text, '…'), 'Clearly mark a truncated message');
-    $clean = CommentNotify_Transport::prepareMessage('<b>评论</b> &amp; https://example.invalid/a www.example.invalid mailto:private@example.invalid', false);
-    notifyTestAssert(!str_contains($clean, 'example.invalid') && !str_contains($clean, '<b>'), 'Suppress links and markup');
-    notifyTestAssert(str_contains($clean, '评论 &'), 'Preserve readable text and decoded entities');
-    notifyTestAssert((bool) preg_match('//u', CommentNotify_Transport::prepareMessage("坏字节\xff")), 'Substitute malformed UTF-8 safely');
-};
-
-$tests['blank secret submissions retain tokens only for unchanged endpoints'] = static function () use ($settings): void {
-    $blank = array_replace($settings, ['gateway_token' => '', 'qq_service_token' => '']);
-    $merged = CommentNotify_Plugin::mergeSecrets($blank);
-    notifyTestSame($settings['gateway_token'], $merged['gateway_token'], 'Keep an unchanged gateway credential');
-    notifyTestSame($settings['qq_service_token'], $merged['qq_service_token'], 'Keep an unchanged QQ service credential');
-    foreach (['gateway_url', 'qq_service_url'] as $key) {
-        $rejected = false;
-        try {
-            CommentNotify_Plugin::mergeSecrets(array_replace($blank, [$key => $settings[$key] . '/different']));
-        } catch (InvalidArgumentException $exception) {
-            $rejected = true;
-        }
-        notifyTestAssert($rejected, 'Require a newly entered token when changing ' . $key);
-    }
-};
-
-$tests['the real settings handler persists blank secrets safely and rejects invalid settings'] = static function () use ($db, $settings): void {
-    CommentNotify_Plugin::configHandle(array_replace($settings, ['gateway_token' => '', 'qq_service_token' => '', 'qq_enabled' => '0']), false);
-    $row = $db->fetchRow($db->select('value')->from('table.options')->where('name = ?', 'plugin:CommentNotify'));
-    $stored = json_decode($row['value'], true, 512, JSON_THROW_ON_ERROR);
-    notifyTestSame($settings['gateway_token'], $stored['gateway_token'], 'The core saves the preserved gateway credential');
-    notifyTestSame($settings['qq_service_token'], $stored['qq_service_token'], 'The core saves the preserved QQ service credential');
-    notifyTestSame('0', $stored['qq_enabled'], 'Persist changed notification switches');
-    $rejected = false;
-    try {
-        CommentNotify_Plugin::configHandle(array_replace($settings, ['wechat_targets' => 'someone-nickname']), false);
-    } catch (Typecho_Widget_Exception $exception) {
-        $rejected = true;
-    }
-    notifyTestAssert($rejected, 'Reject a nickname that is not a supported WeChat bot user ID');
-    $after = $db->fetchRow($db->select('value')->from('table.options')->where('name = ?', 'plugin:CommentNotify'));
-    notifyTestSame($row['value'], $after['value'], 'Invalid submitted settings never replace saved credentials');
-};
-
-$tests['saving channel changes refreshes the same request before shutdown delivery'] = static function () use ($db, $settings, $directory): void {
-    // Load the Options plugin cache, then change configuration through the actual save handler.
-    notifyTestSame('1', CommentNotify_Service::settings()['qq_enabled'], 'Prime the same-request Options cache');
-    CommentNotify_Service::enqueue(notifyTestComment($db), '保存关闭后不能继续投递');
-    CommentNotify_Plugin::configHandle(array_replace($settings, ['qq_enabled' => '0', 'wechat_enabled' => '0']), false);
-    notifyTestSame('0', CommentNotify_Service::settings()['qq_enabled'], 'The saved QQ switch is immediately visible');
-    notifyTestSame('0', CommentNotify_Service::settings()['wechat_enabled'], 'The saved WeChat switch is immediately visible');
-    notifyTestSame(2, CommentNotify_Service::process()['cancelled'], 'Cancel both old destinations before shutdown can deliver');
-    notifyTestSame([], notifyTestRequests($directory), 'Saving disabled channels prevents outgoing requests in that same request');
-};
-
-$tests['default disabled settings validate without credentials or network traffic'] = static function () use ($db, $directory): void {
-    $defaults = CommentNotify_Transport::validate(CommentNotify_Transport::defaults());
-    notifyTestSame('0', $defaults['qq_enabled'], 'QQ is disabled by default');
-    notifyTestSame('0', $defaults['wechat_enabled'], 'WeChat is disabled by default');
-    notifyTestSettings($db, $defaults);
-    notifyTestSame(0, CommentNotify_Plugin::queueComment(notifyTestComment($db)), 'An unconfigured plugin creates no jobs');
-    CommentNotify_Service::process();
-    notifyTestSame([], notifyTestRequests($directory), 'Default activation cannot issue a network request');
-};
-
-$tests['test action enforces administrator, POST and CSRF checks'] = static function () use ($db, $directory, $filename): void {
-    $before = $db->fetchRow($db->select('value')->from('table.options')->where('name = ?', 'plugin:CommentNotify'))['value'];
-    foreach (['anonymous' => 403, 'contributor' => 403, 'get' => 405, 'csrf' => 403, 'invalid-kind' => 400] as $mode => $status) {
-        $result = notifyTestFinishPhp(notifyTestStartPhp([__DIR__ . '/action-worker.php', $filename, $mode]));
-        notifyTestSame(0, $result['code'], 'The action returns a controlled response: ' . $result['stderr']);
-        notifyTestAssert(str_contains($result['stderr'], 'STATUS:' . $status), 'Return HTTP ' . $status . ' for ' . $mode);
-        $body = json_decode($result['stdout'], true, 512, JSON_THROW_ON_ERROR);
-        notifyTestSame(false, $body['ok'], 'Reject invalid test requests');
-    }
-    notifyTestSame([], notifyTestRequests($directory), 'Rejected action calls never reach the mock robot');
-    notifyTestSame($before, $db->fetchRow($db->select('value')->from('table.options')->where('name = ?', 'plugin:CommentNotify'))['value'],
-        'Rejected test requests cannot save settings');
-};
-
-$tests['valid test actions use unsaved fields and send only the chosen platform'] = static function () use ($db, $directory, $filename): void {
-    $before = $db->fetchRow($db->select('value')->from('table.options')->where('name = ?', 'plugin:CommentNotify'))['value'];
-    foreach (['qq', 'wechat'] as $kind) {
-        $result = notifyTestFinishPhp(notifyTestStartPhp([__DIR__ . '/action-worker.php', $filename, $kind]));
-        notifyTestSame(0, $result['code'], 'A valid test action returns cleanly: ' . $result['stderr']);
-        notifyTestAssert(str_contains($result['stderr'], 'STATUS:200'), 'A valid test action returns HTTP 200');
-        $body = json_decode($result['stdout'], true, 512, JSON_THROW_ON_ERROR);
-        notifyTestSame(true, $body['ok'], 'The selected test platform confirms sending');
-        notifyTestSame(1, count($body['results']), 'Test only the explicitly selected recipient list');
-    }
-    $requests = notifyTestRequests($directory);
-    notifyTestSame(2, count($requests), 'Two explicit platform tests send exactly two messages');
-    notifyTestSame('qqbot:c2c:UNSAVED_QQ', $requests[0]['body']['args']['target'], 'Use the unsaved QQ field');
-    notifyTestSame('unsaved-target@im.wechat', $requests[1]['body']['args']['target'], 'Use the unsaved WeChat field');
-    notifyTestSame($before, $db->fetchRow($db->select('value')->from('table.options')->where('name = ?', 'plugin:CommentNotify'))['value'],
-        'Testing a channel never saves the form');
-    notifyTestSame([], notifyTestRows($db), 'Test messages do not become comment notification jobs');
-};
-
-$failed = 0;
-foreach ($tests as $name => $test) {
-    try {
-        notifyTestReset($db, $settings, $directory);
-        $test();
-        fwrite(STDOUT, 'PASS ' . $name . "\n");
-    } catch (Throwable $exception) {
-        ++$failed;
-        fwrite(STDERR, 'FAIL ' . $name . ': ' . $exception->getMessage() . "\n" . $exception->getTraceAsString() . "\n");
-    }
-}
-fwrite(STDOUT, count($tests) . ' tests, ' . $failed . " failures.\n");
+$failed = count(array_filter($results, static fn(string $result): bool => str_starts_with($result, 'FAIL')));
+echo implode("\n", $results) . "\n\n" . count($results) . ' checks, ' . $failed . " failures.\n";
 exit($failed === 0 ? 0 : 1);

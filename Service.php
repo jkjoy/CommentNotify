@@ -1,350 +1,234 @@
 <?php
-if (!defined('__TYPECHO_ROOT_DIR__')) {
-    exit;
+declare(strict_types=1);
+
+if (!defined('__TYPECHO_ROOT_DIR__')) { http_response_code(403); exit; }
+
+require_once __DIR__ . '/Storage.php';
+require_once __DIR__ . '/Http.php';
+require_once __DIR__ . '/Qq.php';
+require_once __DIR__ . '/QqWebhook.php';
+require_once __DIR__ . '/Weixin.php';
+
+function comment_notify_defaults(): array
+{
+    return [
+        'protocol_version' => 2,
+        'qq_enabled' => false, 'qq_app_id' => '', 'qq_app_secret' => '',
+        'qq_target_type' => 'c2c', 'qq_target_id' => '',
+        'weixin_enabled' => false, 'weixin_user_id' => '',
+        'notify_pending' => true, 'notify_approved' => true,
+        'notify_admin' => false, 'include_link' => true,
+    ];
 }
 
-require_once __DIR__ . '/Transport.php';
-
-/** Persistent, per-destination delivery with conservative handling of ambiguous sends. */
-class CommentNotify_Service
+/** Configuration reads use the writer so saved credentials are immediately visible. */
+function comment_notify_option(string $name): array
 {
-    const TABLE = 'table.comment_notify_queue';
-    const MAX_ATTEMPTS = 5;
-    const LEASE_SECONDS = 120;
+    $db = Typecho_Db::get();
+    $query = $db->select('value')->from('table.options')->where('name = ? AND user = ?', $name, 0)->limit(1);
+    $row = $db->fetchRow(comment_notify_query($query));
+    $value = $row ? json_decode((string)$row['value'], true) : null;
+    return is_array($value) ? $value : [];
+}
 
-    private static $schemaReady = false;
-
-    public static function settings(): array
-    {
-        $settings = CommentNotify_Transport::defaults();
+function comment_notify_store(string $name, array $record): void
+{
+    $db = Typecho_Db::get();
+    $value = json_encode($record, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+    $query = $db->select('name')->from('table.options')->where('name = ? AND user = ?', $name, 0)->limit(1);
+    $exists = $db->fetchRow(comment_notify_query($query));
+    if (!$exists) {
         try {
-            $config = Typecho_Widget::widget('Widget_Options')->plugin('CommentNotify');
-            foreach ($settings as $key => $value) {
-                if (isset($config->$key) && is_scalar($config->$key)) {
-                    $settings[$key] = (string) $config->$key;
-                }
-            }
-        } catch (Throwable $e) {
-            // The settings form also calls this before the plugin has saved options.
-        }
-        return $settings;
-    }
-
-    /** Called on activation only; ordinary comment requests never run DDL. */
-    public static function install()
-    {
-        if (self::$schemaReady) {
+            comment_notify_query($db->insert('table.options')->rows(['name' => $name, 'user' => 0, 'value' => $value]));
             return;
-        }
-        $db = self::db();
-        $prefix = $db->getPrefix();
-        $adapter = $db->getAdapterName();
-        if (!preg_match('/^[a-zA-Z0-9_]+$/D', $prefix)) {
-            throw new RuntimeException('数据库表前缀包含不支持的字符。');
-        }
-        if (!preg_match('/mysql|mysqli|sqlite|pgsql/i', $adapter)) {
-            throw new RuntimeException('评论通知支持 MySQL、SQLite 和 PostgreSQL 数据库。');
-        }
-        $mysql = (bool) preg_match('/mysql|mysqli/i', $adapter);
-        $sqlite = (bool) preg_match('/sqlite/i', $adapter);
-        $id = $mysql ? 'INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY'
-            : ($sqlite ? 'INTEGER PRIMARY KEY AUTOINCREMENT' : 'SERIAL PRIMARY KEY');
-        $quote = $mysql ? '`' : '"';
-        $table = $quote . $prefix . 'comment_notify_queue' . $quote;
-        $index = $mysql ? ', INDEX comment_notify_due (state, next_at, id)' : '';
-        $suffix = $mysql ? ' ENGINE=InnoDB DEFAULT CHARSET=utf8mb4' : '';
-        $db->query("CREATE TABLE IF NOT EXISTS {$table} (
-            id {$id},
-            event_key VARCHAR(64) NOT NULL UNIQUE,
-            coid INTEGER NOT NULL,
-            kind VARCHAR(16) NOT NULL,
-            target VARCHAR(512) NOT NULL,
-            envelope TEXT NOT NULL,
-            config_hash VARCHAR(64) NOT NULL,
-            state VARCHAR(16) NOT NULL DEFAULT 'pending',
-            attempts INTEGER NOT NULL DEFAULT 0,
-            next_at INTEGER NOT NULL DEFAULT 0,
-            lock_at INTEGER NOT NULL DEFAULT 0,
-            lock_token VARCHAR(64) NOT NULL DEFAULT '',
-            error VARCHAR(255) NOT NULL DEFAULT '',
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL
-            {$index}){$suffix}", Typecho_Db::WRITE);
-        if (!$mysql) {
-            $indexName = $quote . $prefix . 'comment_notify_due' . $quote;
-            $db->query("CREATE INDEX IF NOT EXISTS {$indexName} ON {$table} (state, next_at, id)",
-                Typecho_Db::WRITE);
-        }
-        self::$schemaReady = true;
-    }
-
-    /** Return the number of new jobs; existing and sent events retain their deduplication key. */
-    public static function enqueue(int $coid, string $message, ?array $settings = null): int
-    {
-        if ($coid < 1) {
-            return 0;
-        }
-        $settings = $settings === null ? self::settings()
-            : array_merge(CommentNotify_Transport::defaults(), $settings);
-        $message = CommentNotify_Transport::prepareMessage($message,
-            (string) ($settings['include_links'] ?? '0') === '1');
-        if (trim($message) === '') {
-            return 0;
-        }
-        $db = self::db();
-        $count = 0;
-        foreach (CommentNotify_Transport::destinations($settings) as $destination) {
-            $destination = self::destination($destination);
-            $snapshot = self::encode($destination);
-            $eventKey = hash('sha256', $coid . "\n" . $snapshot);
-            $existing = self::readRow($db->select('id', 'state')->from(self::TABLE)
-                ->where('event_key = ?', $eventKey)->limit(1));
-            if ($existing && $existing['state'] !== 'cancelled') {
-                continue;
-            }
-            $envelope = $destination;
-            $envelope['message'] = $message;
-            $envelope['request_id'] = bin2hex(random_bytes(24));
-            $now = time();
-            $rows = array(
-                'event_key' => $eventKey, 'coid' => $coid,
-                'kind' => $destination['kind'], 'target' => $destination['target'],
-                'envelope' => self::encode($envelope), 'config_hash' => hash('sha256', $snapshot),
-                'state' => 'pending', 'attempts' => 0, 'next_at' => $now,
-                'lock_at' => 0, 'lock_token' => '', 'error' => '', 'updated_at' => $now
-            );
-            if ($existing) {
-                // A later real comment/approval event can revive a pre-send cancellation.
-                // The unique key still requires the exact same comment and route snapshot;
-                // sent or ambiguous sends are never revived by another finish hook.
-                $count += (int) (bool) $db->query($db->update(self::TABLE)->rows($rows)
-                    ->where('id = ? AND state = ?', (int) $existing['id'], 'cancelled')
-                    ->where('event_key = ?', $eventKey));
-                continue;
-            }
-            $rows['created_at'] = $now;
-            try {
-                $db->query($db->insert(self::TABLE)->rows($rows));
-                ++$count;
-            } catch (Throwable $e) {
-                // A simultaneous finish hook may have inserted the same unique event.
-                if (!self::readRow($db->select('id')->from(self::TABLE)->where('event_key = ?', $eventKey)->limit(1))) {
-                    throw $e;
-                }
-            }
-        }
-        return $count;
-    }
-
-    /** Only due pending jobs are eligible; ambiguous jobs always require an administrator. */
-    public static function process(int $limit = 4): array
-    {
-        $db = self::db();
-        $now = time();
-        $stats = array('sent' => 0, 'failed' => 0, 'uncertain' => 0, 'cancelled' => 0);
-        $stats['uncertain'] = (int) $db->query($db->update(self::TABLE)->rows(array(
-            'state' => 'uncertain', 'lock_at' => 0, 'lock_token' => '', 'next_at' => 0,
-            'error' => '发送进程中断，机器人可能已经接收。请核实后手动重试。', 'updated_at' => $now
-        ))->where('state = ?', 'sending')->where('lock_at <= ?', $now - self::LEASE_SECONDS));
-        if ($limit < 1) {
-            return $stats;
-        }
-        $settings = self::settings();
-        $destinations = self::destinationHashes($settings);
-        $jobs = self::readAll($db->select()->from(self::TABLE)
-            ->where('state = ? AND next_at <= ?', 'pending', $now)
-            ->where('attempts < ?', self::MAX_ATTEMPTS)
-            ->order('next_at', Typecho_Db::SORT_ASC)->order('id', Typecho_Db::SORT_ASC)
-            ->limit(min(20, $limit)));
-        foreach ($jobs as $job) {
-            $token = bin2hex(random_bytes(24));
-            $claimedAt = time();
-            $attempts = (int) $job['attempts'] + 1;
-            $claimed = $db->query($db->update(self::TABLE)->rows(array(
-                'state' => 'sending', 'lock_at' => $claimedAt, 'lock_token' => $token,
-                'attempts' => $attempts, 'updated_at' => $claimedAt
-            ))->where('id = ? AND state = ?', (int) $job['id'], 'pending')
-                ->where('attempts = ? AND next_at <= ?', (int) $job['attempts'], $claimedAt));
-            if (!$claimed) {
-                continue;
-            }
-
-            $comment = self::readRow($db->select('coid', 'type', 'status', 'authorId', 'ownerId')
-                ->from('table.comments')->where('coid = ?', (int) $job['coid'])->limit(1));
-            if (!$comment || $comment['type'] !== 'comment' || $comment['status'] !== 'approved') {
-                if (self::finish($job, $token, 'cancelled', '评论已删除、未审核通过或不再是普通评论。')) {
-                    ++$stats['cancelled'];
-                }
-                continue;
-            }
-            if ((string) ($settings['notify_owner'] ?? '0') !== '1'
-                && (int) $comment['authorId'] > 0
-                && (int) $comment['authorId'] === (int) $comment['ownerId']) {
-                if (self::finish($job, $token, 'cancelled', '已跳过文章作者本人的评论。')) {
-                    ++$stats['cancelled'];
-                }
-                continue;
-            }
-            $envelope = json_decode((string) $job['envelope'], true);
-            if (!self::validEnvelope($envelope, $job)) {
-                if (self::finish($job, $token, 'failed', '通知记录格式无效，请检查插件数据。')) {
-                    ++$stats['failed'];
-                }
-                continue;
-            }
-            if (!isset($destinations[$job['config_hash']])) {
-                if (self::finish($job, $token, 'cancelled', '通知渠道或接收目标已变更，旧任务已取消。')) {
-                    ++$stats['cancelled'];
-                }
-                continue;
-            }
-
-            try {
-                $result = CommentNotify_Transport::send($envelope, $settings);
-                if (!is_array($result) || !array_key_exists('ok', $result)) {
-                    throw new RuntimeException('Invalid delivery result');
-                }
-            } catch (Throwable $e) {
-                // An exception may occur after the request reached the robot.
-                $result = array('ok' => false, 'uncertain' => true,
-                    'message' => '无法确认机器人是否接收，请核实后手动重试。');
-            }
-            if (!empty($result['ok'])) {
-                if (self::finish($job, $token, 'sent', '')) {
-                    ++$stats['sent'];
-                }
-            } elseif (!empty($result['uncertain'])) {
-                if (self::finish($job, $token, 'uncertain',
-                    self::safeError($result['message'] ?? '机器人可能已接收，请核实后手动重试。', $settings))) {
-                    ++$stats['uncertain'];
-                }
-            } else {
-                $state = $attempts >= self::MAX_ATTEMPTS ? 'failed' : 'pending';
-                $nextAt = $state === 'pending' ? time() + min(3600, 60 * (2 ** ($attempts - 1))) : 0;
-                if (self::finish($job, $token, $state,
-                    self::safeError($result['message'] ?? '机器人明确拒绝了通知，请检查配置。', $settings), $nextAt)) {
-                    ++$stats['failed'];
-                }
-            }
-        }
-        return $stats;
-    }
-
-    /** Public queue metadata only: never expose message snapshots, credentials or lease tokens. */
-    public static function rows(int $limit = 20): array
-    {
-        $db = self::db();
-        return self::readAll($db->select('id', 'coid', 'kind', 'target', 'state', 'attempts',
-            'next_at', 'lock_at', 'error', 'created_at', 'updated_at')->from(self::TABLE)
-            ->order('id', Typecho_Db::SORT_DESC)->limit(max(1, min(100, $limit))));
-    }
-
-    /** Preserve the original target and request id even when explicitly retrying an ambiguous send. */
-    public static function retry(int $id): bool
-    {
-        if ($id < 1) {
-            return false;
-        }
-        $db = self::db();
-        $job = self::readRow($db->select()->from(self::TABLE)->where('id = ?', $id)->limit(1));
-        if (!$job || !in_array($job['state'], array('failed', 'uncertain'), true)) {
-            return false;
-        }
-        $envelope = json_decode((string) $job['envelope'], true);
-        if (!self::validEnvelope($envelope, $job)
-            || !isset(self::destinationHashes(self::settings())[$job['config_hash']])) {
-            return false;
-        }
-        $now = time();
-        return (bool) $db->query($db->update(self::TABLE)->rows(array(
-            'state' => 'pending', 'attempts' => 0, 'next_at' => $now,
-            'lock_at' => 0, 'lock_token' => '', 'error' => '', 'updated_at' => $now
-        ))->where('id = ?', $id)->where('state IN ?', array('failed', 'uncertain')));
-    }
-
-    private static function db()
-    {
-        return Typecho_Db::get();
-    }
-
-    /** Queue decisions read from the writer, avoiding replica lag after an atomic claim. */
-    private static function readRow($query)
-    {
-        $db = self::db();
-        return $db->fetchRow($db->query($query->prepare($query), Typecho_Db::WRITE));
-    }
-
-    private static function readAll($query): array
-    {
-        $db = self::db();
-        return $db->fetchAll($db->query($query->prepare($query), Typecho_Db::WRITE));
-    }
-
-    private static function destination(array $destination): array
-    {
-        $snapshot = array();
-        foreach (array('kind', 'provider', 'endpoint', 'channel', 'account', 'target') as $key) {
-            if (!array_key_exists($key, $destination) || !is_string($destination[$key])) {
-                throw new RuntimeException('通知目标格式无效。');
-            }
-            $snapshot[$key] = $destination[$key];
-        }
-        return $snapshot;
-    }
-
-    private static function destinationHashes(array $settings): array
-    {
-        $hashes = array();
-        foreach (CommentNotify_Transport::destinations($settings) as $destination) {
-            $hashes[hash('sha256', self::encode(self::destination($destination)))] = true;
-        }
-        return $hashes;
-    }
-
-    private static function validEnvelope($envelope, array $job): bool
-    {
-        if (!is_array($envelope) || !isset($envelope['message'], $envelope['request_id'])
-            || !is_string($envelope['message']) || !is_string($envelope['request_id'])
-            || !preg_match('/^[a-zA-Z0-9_-]{1,128}$/D', $envelope['request_id'])) {
-            return false;
-        }
-        try {
-            $snapshot = self::destination($envelope);
-            return $snapshot['kind'] === $job['kind'] && $snapshot['target'] === $job['target']
-                && hash_equals((string) $job['config_hash'], hash('sha256', self::encode($snapshot)));
-        } catch (Throwable $e) {
-            return false;
+        } catch (Throwable $exception) {
+            if (!$db->fetchRow(comment_notify_query($query))) { throw $exception; }
         }
     }
+    comment_notify_query($db->update('table.options')->rows(['value' => $value])->where('name = ? AND user = ?', $name, 0));
+}
 
-    private static function encode(array $value): string
-    {
-        $json = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-        if ($json === false) {
-            throw new RuntimeException('通知内容编码失败。');
-        }
-        return $json;
+function comment_notify_read(string $key): array
+{
+    return comment_notify_state_read($key);
+}
+
+function comment_notify_write(string $key, array $record): void
+{
+    comment_notify_state_write($key, $record);
+}
+
+function comment_notify_config(): array
+{
+    $defaults = comment_notify_defaults();
+    $saved = comment_notify_option('plugin:CommentNotify');
+    if (($saved['protocol_version'] ?? null) !== 2) { return $defaults; }
+    foreach ($defaults as $key => $value) {
+        if (array_key_exists($key, $saved) && gettype($saved[$key]) === gettype($value)) { $defaults[$key] = $saved[$key]; }
     }
+    return $defaults;
+}
 
-    private static function finish(array $job, string $token, string $state, string $error, int $nextAt = 0): bool
-    {
-        $db = self::db();
-        return (bool) $db->query($db->update(self::TABLE)->rows(array(
-            'state' => $state, 'next_at' => $nextAt, 'lock_at' => 0,
-            'lock_token' => '', 'error' => $error, 'updated_at' => time()
-        ))->where('id = ? AND state = ?', (int) $job['id'], 'sending')->where('lock_token = ?', $token));
-    }
+function comment_notify_input(array $input, string $key): string
+{
+    return isset($input[$key]) && is_scalar($input[$key]) ? trim((string)$input[$key]) : '';
+}
 
-    private static function safeError($message, array $settings): string
-    {
-        $message = is_scalar($message) ? (string) $message : '机器人未确认接收，请检查配置。';
-        foreach ($settings as $key => $value) {
-            if (preg_match('/token|secret|password|key/i', (string) $key) && is_scalar($value)
-                && strlen((string) $value) > 3) {
-                $message = str_replace((string) $value, '[已隐藏]', $message);
-            }
+function comment_notify_validate(array $input, array $existing): array
+{
+    $existing = array_replace(comment_notify_defaults(), array_intersect_key($existing, comment_notify_defaults()));
+    $config = $existing;
+    $errors = [];
+    foreach (['qq_enabled', 'weixin_enabled', 'notify_pending', 'notify_approved', 'notify_admin', 'include_link'] as $key) {
+        $value = comment_notify_input($input, $key);
+        if (array_key_exists($key, $input) && !in_array($input[$key], [false, true, 0, 1, '0', '1', ''], true)) {
+            $errors[] = '通知开关值必须为 0 或 1。';
         }
-        $message = trim(preg_replace('/[\x00-\x1f\x7f]/u', ' ', strip_tags($message)) ?? '通知发送失败。');
-        return Typecho_Common::subStr($message, 0, 255, '');
+        $config[$key] = $value === '1';
+    }
+    foreach (['qq_app_id', 'qq_app_secret', 'qq_target_type', 'qq_target_id'] as $key) {
+        if (isset($input[$key]) && !is_scalar($input[$key])) { $errors[] = 'QQ 配置项必须是文本。'; }
+    }
+    foreach (['qq_app_id', 'qq_target_type', 'qq_target_id'] as $key) { $config[$key] = comment_notify_input($input, $key); }
+    $secret = comment_notify_input($input, 'qq_app_secret');
+    if ($secret !== '') {
+        $config['qq_app_secret'] = $secret;
+    } elseif ($config['qq_app_id'] !== $existing['qq_app_id']) {
+        $config['qq_app_secret'] = '';
+        if ($config['qq_app_id'] !== '') { $errors[] = '更换 QQ AppID 时，请重新填写 AppSecret。'; }
+    }
+    if ($config['qq_app_id'] !== '' && !preg_match('/\A[0-9]{1,32}\z/D', $config['qq_app_id'])) { $errors[] = 'QQ AppID 只能填写数字。'; }
+    if ($config['qq_app_secret'] !== '' && !preg_match('/\A[A-Za-z0-9_-]{1,256}\z/D', $config['qq_app_secret'])) { $errors[] = 'QQ AppSecret 格式无效。'; }
+    if (!in_array($config['qq_target_type'], ['c2c', 'group', 'channel'], true)) { $errors[] = '请选择有效的 QQ 接收类型。'; }
+    if ($config['qq_target_id'] !== '' && !preg_match('/\A[A-Za-z0-9_-]{1,128}\z/D', $config['qq_target_id'])) { $errors[] = 'QQ 接收 ID 格式无效。'; }
+    if ($config['qq_enabled'] && ($config['qq_app_id'] === '' || $config['qq_app_secret'] === '' || $config['qq_target_id'] === '')) {
+        $errors[] = '启用 QQ 通知前，请填写 AppID、AppSecret 和接收 ID。';
+    }
+    if ($config['weixin_enabled']) {
+        $account = comment_notify_read('weixin_account');
+        if (empty($account['token']) || !empty($account['expired']) || $config['weixin_user_id'] === '') {
+            $errors[] = '启用微信通知前，请先扫码登录，并向机器人发送消息后同步绑定接收人。';
+        }
+    }
+    if (!$config['notify_pending'] && !$config['notify_approved']) { $errors[] = '请至少选择一种评论状态。'; }
+    return ['config' => $config, 'errors' => array_values(array_unique($errors))];
+}
+
+function comment_notify_save_config(array $config): void
+{
+    $existing = comment_notify_config();
+    $config = array_replace(comment_notify_defaults(), array_intersect_key($config, comment_notify_defaults()));
+    $config['protocol_version'] = 2;
+    if ($existing['qq_app_id'] !== $config['qq_app_id'] || $existing['qq_app_secret'] !== $config['qq_app_secret']) {
+        foreach (['qq_token', 'qq_binding', 'qq_webhook'] as $key) { comment_notify_write($key, []); }
+    } elseif ($existing['qq_target_type'] !== $config['qq_target_type'] || $existing['qq_target_id'] !== $config['qq_target_id']) {
+        comment_notify_write('qq_binding', []);
+    }
+    // Replace the complete option to discard credentials and switches from the old transport.
+    comment_notify_store('plugin:CommentNotify', $config);
+}
+
+/** Preserve concurrent settings changes while applying the winner's bound QQ target. */
+function comment_notify_qq_save_bound_target(array $expected, string $target): bool
+{
+    $db = Typecho_Db::get();
+    $query = $db->select('value')->from('table.options')
+        ->where('name = ? AND user = ?', 'plugin:CommentNotify', 0)->limit(1);
+    $row = $db->fetchRow(comment_notify_query($query));
+    $raw = $row ? (string)$row['value'] : '';
+    $current = json_decode($raw, true);
+    if (!is_array($current) || ($current['protocol_version'] ?? null) !== 2
+        || ($current['qq_app_id'] ?? null) !== $expected['qq_app_id']
+        || ($current['qq_app_secret'] ?? null) !== $expected['qq_app_secret']
+        || ($current['qq_target_type'] ?? null) !== $expected['qq_target_type']
+        || ($current['qq_target_id'] ?? null) !== $expected['qq_target_id']) { return false; }
+    if (($current['qq_target_id'] ?? null) === $target) { return true; }
+    $current['qq_target_id'] = $target;
+    $value = json_encode($current, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+    $condition = preg_match('/mysql|mysqli/i', $db->getAdapterName()) ? 'BINARY value = ?' : 'value = ?';
+    return (bool)comment_notify_query($db->update('table.options')->rows(['value' => $value])
+        ->where('name = ? AND user = ?', 'plugin:CommentNotify', 0)->where($condition, $raw));
+}
+
+function comment_notify_admin_url(): string
+{
+    return Typecho_Common::url('options-plugin.php?config=CommentNotify', Typecho_Widget::widget('Widget_Options')->adminUrl);
+}
+
+function comment_notify_status(): array
+{
+    $config = comment_notify_config();
+    return [
+        'qq' => array_merge(comment_notify_qq_webhook_status(), [
+            'target_type' => $config['qq_target_type'], 'target_id' => $config['qq_target_id'], 'enabled' => $config['qq_enabled'],
+        ]),
+        'weixin' => array_merge(comment_notify_weixin_status(), ['enabled' => $config['weixin_enabled']]),
+        'results' => ['qq' => comment_notify_read('result_qq'), 'weixin' => comment_notify_read('result_weixin')],
+    ];
+}
+
+function comment_notify_text(string $value, int $limit): string
+{
+    $text = strip_tags(html_entity_decode($value, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    $text = trim((string)preg_replace('/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/u', '', $text));
+    $characters = preg_split('//u', $text, -1, PREG_SPLIT_NO_EMPTY);
+    if (!is_array($characters)) { return ''; }
+    return count($characters) > $limit ? implode('', array_slice($characters, 0, $limit)) . '…' : $text;
+}
+
+function comment_notify_deliver(string $channel, array $config, string $text, ?callable $transport = null): array
+{
+    try {
+        match ($channel) {
+            'qq' => comment_notify_qq_send($config, $text, $transport),
+            'weixin' => comment_notify_weixin_send($config, $text, $transport),
+            default => throw new RuntimeException('无效的通知渠道。'),
+        };
+        $result = ['ok' => true, 'message' => ($channel === 'qq' ? 'QQ' : '微信') . '接口已接受通知。', 'time' => time()];
+    } catch (Throwable $exception) {
+        $message = get_class($exception) === RuntimeException::class ? $exception->getMessage() : '通知发送失败，请检查数据库和服务器环境。';
+        $result = ['ok' => false, 'message' => $message, 'time' => time()];
+    }
+    try { comment_notify_write('result_' . $channel, $result); }
+    catch (Throwable) { error_log('[CommentNotify] 无法保存通知结果。'); }
+    return $result;
+}
+
+function comment_notify_test(string $channel, ?callable $transport = null): array
+{
+    $config = comment_notify_config();
+    $options = Typecho_Widget::widget('Widget_Options');
+    $text = '评论通知连接测试' . "\n站点：" . comment_notify_text((string)$options->title, 60)
+        . "\n时间：" . (new Typecho_Date(time()))->format('Y-m-d H:i:s');
+    if ($config['include_link']) { $text .= "\n" . $options->siteUrl; }
+    return comment_notify_deliver($channel, $config, $text, $transport);
+}
+
+function comment_notify_comment_created(int $coid, ?callable $transport = null): void
+{
+    try {
+        $config = comment_notify_config();
+        if (!$config['qq_enabled'] && !$config['weixin_enabled']) { return; }
+        $db = Typecho_Db::get();
+        $query = $db->select()->from('table.comments')->where('coid = ?', $coid)->limit(1);
+        $comment = $db->fetchRow(comment_notify_query($query));
+        if (!$comment || $comment['type'] !== 'comment' || !in_array($comment['status'], ['waiting', 'approved'], true)
+            || !$config[$comment['status'] === 'waiting' ? 'notify_pending' : 'notify_approved']
+            || (!$config['notify_admin'] && (int)$comment['authorId'] > 0)) { return; }
+        $widget = Typecho_Widget::widget('Widget_Abstract_Comments@comment-notify-' . $coid);
+        $widget->push($comment);
+        $text = '新评论 · ' . comment_notify_text((string)Typecho_Widget::widget('Widget_Options')->title, 60)
+            . "\n文章：" . comment_notify_text((string)$widget->title, 100)
+            . "\n状态：" . ($comment['status'] === 'approved' ? '已发布' : '待审核')
+            . "\n评论人：" . comment_notify_text((string)$comment['author'], 50)
+            . "\n\n" . comment_notify_text((string)$comment['text'], 400);
+        if ($config['include_link']) {
+            $text .= "\n\n" . ($comment['status'] === 'approved' ? $widget->permalink : $widget->parentContent->permalink . '#comments');
+        }
+        foreach (['qq', 'weixin'] as $channel) {
+            if ($config[$channel . '_enabled']) { comment_notify_deliver($channel, $config, $text, $transport); }
+        }
+    } catch (Throwable) {
+        error_log('[CommentNotify] 无法准备评论通知。');
     }
 }

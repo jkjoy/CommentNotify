@@ -1,12 +1,14 @@
 <?php
 declare(strict_types=1);
 require __DIR__ . '/bootstrap.php';
-if (count($argv) !== 3 || !is_file($argv[1])) {
-    exit(2);
-}
-notifyTestConnect($argv[1]);
+if (count($argv) !== 3) { exit(2); }
+$db = notifyTestConnect(':memory:');
+notifyTestSeed($db);
 require_once dirname(__DIR__) . '/Action.php';
-$mode = $argv[2];
+comment_notify_storage_ensure();
+$mode = $argv[1];
+$operation = $argv[2];
+Typecho_Plugin::init(['activated' => $mode === 'disabled' ? [] : ['CommentNotify' => []], 'handles' => []]);
 $_SERVER['REQUEST_METHOD'] = $mode === 'get' ? 'GET' : 'POST';
 $_SERVER['REQUEST_URI'] = '/action/comment-notify';
 $_SERVER['HTTP_REFERER'] = 'https://comment-notify-test.invalid/admin/options-plugin.php?config=CommentNotify';
@@ -15,19 +17,17 @@ if ($mode !== 'anonymous') {
     notifyTestAssert(Typecho_Widget::widget('Widget_User')->simpleLogin([
         'uid' => 1, 'name' => 'test-user', 'screenName' => '测试用户', 'mail' => 'user@example.invalid',
         'url' => '', 'group' => $group, 'authCode' => 'isolated-auth',
-    ], true), 'Authenticate the action worker');
+    ], true), 'Authenticate isolated action');
 }
-$settings = CommentNotify_Service::settings();
-$settings['gateway_token'] = '';
-$settings['qq_service_token'] = '';
-$settings['qq_targets'] = 'qqbot:c2c:UNSAVED_QQ';
-$settings['wechat_targets'] = 'unsaved-target@im.wechat';
-$_POST = ['do' => 'test', 'kind' => $mode === 'wechat' ? 'wechat' : 'qq', 'settings' => $settings];
-if ($mode === 'invalid-kind') {
-    $_POST['kind'] = 'invalid';
-}
+comment_notify_save_config(array_replace(comment_notify_defaults(), ['qq_app_id' => '123456', 'qq_app_secret' => 'test-secret']));
+comment_notify_write('qq_token', ['token' => 'cached-token']);
+comment_notify_write('weixin_account', ['token' => 'weixin-test-secret', 'account_id' => 'bot@im.bot', 'owner_id' => 'owner@im.wechat', 'base_url' => 'https://ilinkai.weixin.qq.com', 'expired' => false]);
+comment_notify_write('weixin_sync', ['context_tokens' => ['owner@im.wechat' => 'session-context']]);
+$_POST = ['do' => $operation];
 $_POST['_'] = $mode === 'csrf' ? 'invalid-token' : Typecho_Widget::widget('Widget_Security')->getToken($_SERVER['HTTP_REFERER']);
-register_shutdown_function(static function (): void {
+$before = notifyTestSnapshot($db);
+register_shutdown_function(static function () use ($db, $before): void {
     fwrite(STDERR, 'STATUS:' . (http_response_code() ?: 200) . "\n");
+    fwrite(STDERR, 'UNCHANGED:' . ($before === notifyTestSnapshot($db) ? 'yes' : 'no') . "\n");
 });
 Typecho_Widget::widget('CommentNotify_Action')->action();
